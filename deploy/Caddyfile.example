@@ -1,0 +1,14 @@
+# Thay các hostname bằng domain trỏ tới máy chủ.
+signal.example.org {
+  reverse_proxy 127.0.0.1:4001
+}
+
+relay.example.org {
+  reverse_proxy 127.0.0.1:4002
+}
+
+peer.example.org {
+  root * /srv/ds01/src/web-peer/dist
+  try_files {path} /index.html
+  file_server
+}
