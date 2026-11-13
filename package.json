@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "workspaces": [
     "src/shared",
@@ -19,13 +19,18 @@
     "start:signaling": "npm run start -w @ds01/signaling",
     "start:relay": "npm run start -w @ds01/relay",
     "build:web": "npm run build -w @ds01/web-peer",
-    "typecheck": "tsc --noEmit -p src/shared && tsc --noEmit -p src/signaling && tsc --noEmit -p src/relay && tsc --noEmit -p src/web-peer && tsc --noEmit -p scripts",
+    "typecheck": "tsc --noEmit -p src/shared && tsc --noEmit -p src/signaling && tsc --noEmit -p src/relay && tsc --noEmit -p src/web-peer && tsc --noEmit -p scripts && tsc --noEmit -p tests",
     "lint": "eslint src tests scripts --ext .ts,.tsx",
     "test": "vitest run",
-    "test:core": "vitest run tests/protocol.test.ts tests/services.test.ts tests/peer.test.ts tests/project-chat.test.ts",
-    "benchmark:relay": "tsx scripts/benchmark-relay.ts"
+    "test:core": "vitest run",
+    "benchmark:relay": "tsx scripts/benchmark-relay.ts",
+    "load:relay": "node scripts/load-relay.mjs",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "setup:env": "node scripts/init-env.mjs",
+    "build:report": "node scripts/build-report.mjs"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "@types/node": "^22.15.0",
     "@typescript-eslint/eslint-plugin": "^8.35.0",
     "@typescript-eslint/parser": "^8.35.0",

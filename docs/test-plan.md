@@ -1,19 +1,23 @@
 # Kế hoạch kiểm thử DS01
 
+> Luồng mặc định hiện dùng tài khoản: xem [authentication.md](authentication.md). Để chạy nguyên các ca dùng `peer-a/peer-b/peer-c` bên dưới, chọn **Thử nghiệm kỹ thuật bằng Peer ID**. Với tài khoản mới, đăng ký/đăng nhập rồi thay ID trong kịch bản bằng `user_<username>`.
+
+Hướng dẫn thao tác từng bước, script protocol và bảng ghi kết quả nằm trong [MANUAL-ACCEPTANCE.md](MANUAL-ACCEPTANCE.md) và [manual-results.csv](manual-results.csv). Các trạng thái dưới đây không thay thế kết quả chạy thực tế của từng buổi kiểm thử.
+
 ## Ma trận bắt buộc
 
 | ID | Loại | Thao tác | Kết quả mong đợi | Trạng thái hiện tại |
 |---|---|---|---|---|
 | F1 | Chức năng | Đăng ký A/B/C | Ba Peer ID online và duy nhất | Tự động đạt; cần ảnh demo |
 | F2 | Chức năng | A lookup B | Trả đúng online/connection | Tự động đạt |
-| F3 | Chức năng | A gửi B bằng DIRECT | B nhận, ACK; relay không FORWARD cùng ID | Cần WebRTC thật |
-| F4 | Chức năng | Ép DIRECT lỗi | Tự chuyển RELAY, có FORWARD và ACK | Tự động bằng mock; cần UI demo |
+| F3 | Chức năng | A gửi B bằng DIRECT | B nhận, ACK; relay không FORWARD cùng ID | Có browser WebRTC local thật; WAN cần thử riêng |
+| F4 | Chức năng | Đóng DIRECT đã mở | Tự chuyển RELAY, có FORWARD và ACK | Có browser local thật |
 | F5 | Chức năng | A tạo nhóm A/B/C và gửi | B/C nhận; ACK riêng | Tự động đạt; cần ảnh demo |
 | F6 | Chức năng | Thêm/xóa C | Membership nhất quán; C không nhận tin mới sau khi xóa | Tự động đạt |
-| F7 | Chức năng | Tải lại peer | Lịch sử localStorage được khôi phục | Cần browser thật |
+| F7 | Chức năng | Tải lại peer | Lịch sử localStorage được khôi phục | Có browser thật |
 | F8 | Chức năng | Peer offline | Báo offline/failed, không hứa giao lại | Tự động một phần; cần demo |
 | C1 | Đồng thời | Hai peer sửa nhóm với cùng version | Một thành công, một stale/rejected | Tự động đạt |
-| C2 | Đồng thời | B và C gửi nhóm gần đồng thời | Không mất/trùng; thứ tự hợp lý từng sender | Cần demo |
+| C2 | Đồng thời | B và C gửi nhóm gần đồng thời | Không mất/trùng; thứ tự hợp lý từng sender | Browser local và regression ordering; tiếp tục demo thủ công |
 | E1 | Lỗi/phục hồi | Tắt C đột ngột rồi mở lại | Presence đổi; lịch sử cũ còn; tin mới gửi được | Cần demo |
 | E2 | Lỗi/phục hồi | Tắt relay khi DIRECT cũng mất | Tin failed; relay mở lại nhận tin mới | Cần demo |
 | S1 | Bảo mật | Giả `senderId` khác token | Relay REJECT, không FORWARD | Tự động đạt |

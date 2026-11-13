@@ -1,0 +1,7 @@
+node_modules
+.git
+.env
+.data
+src/web-peer/dist
+docs/evidence
+*.log

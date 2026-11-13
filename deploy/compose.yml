@@ -1,0 +1,55 @@
+services:
+  signaling:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: app
+    environment:
+      NODE_ENV: production
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      PEER_SECRET: ${PEER_SECRET:?Set PEER_SECRET}
+      SIGNAL_STATE_PATH: /app/.data/signaling.json
+    ports: ['4001:4001']
+    volumes: [signal-state:/app/.data]
+    restart: unless-stopped
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: app
+    command: ['npm', 'run', 'start:relay']
+    environment:
+      NODE_ENV: production
+      PEER_SECRET: ${PEER_SECRET:?Set PEER_SECRET}
+      SIGNAL_INTERNAL_URL: http://signaling:4001
+    ports: ['4002:4002']
+    depends_on: [signaling]
+    restart: unless-stopped
+  relay-backup:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: app
+    command: ['npm', 'run', 'start:relay']
+    environment:
+      NODE_ENV: production
+      PEER_SECRET: ${PEER_SECRET:?Set PEER_SECRET}
+      SIGNAL_INTERNAL_URL: http://signaling:4001
+      RELAY_PORT: 4003
+    ports: ['4003:4003']
+    depends_on: [signaling]
+    restart: unless-stopped
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: web
+      args:
+        VITE_SIGNAL_URL: ${VITE_SIGNAL_URL:-http://localhost:4001}
+        VITE_RELAY_URL: ${VITE_RELAY_URL:-http://localhost:4002}
+        VITE_RELAY_URLS: ${VITE_RELAY_URLS:-http://localhost:4003}
+        VITE_ICE_SERVERS: ${VITE_ICE_SERVERS:-}
+    ports: ['8080:80']
+    restart: unless-stopped
+volumes:
+  signal-state:

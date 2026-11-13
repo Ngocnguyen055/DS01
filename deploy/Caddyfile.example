@@ -7,6 +7,10 @@ relay.example.org {
   reverse_proxy 127.0.0.1:4002
 }
 
+relay-backup.example.org {
+  reverse_proxy 127.0.0.1:4003
+}
+
 peer.example.org {
   root * /srv/ds01/src/web-peer/dist
   try_files {path} /index.html
