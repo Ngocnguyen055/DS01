@@ -1,4 +1,4 @@
-import { isDirectMessageBetween, peerIdSchema, type DirectChatContact, type DirectChatStore, type StoredMessage, type MessageStatus, type ChatAttachment, orderMessages, } from "@ds01/shared";
+import { isDirectMessageBetween, parseMessage, peerIdSchema, sameMessageEvent, type DirectChatContact, type DirectChatStore, type StoredMessage, type MessageStatus, type ChatAttachment, orderMessages, } from "@ds01/shared";
 export class WebStore implements DirectChatStore {
     private contactWrites = Promise.resolve();
     constructor(private scope: string) { }
@@ -16,7 +16,14 @@ export class WebStore implements DirectChatStore {
             const rows: unknown = JSON.parse(localStorage.getItem(this.key) || "[]");
             if (!Array.isArray(rows))
                 throw new Error('invalid history');
-            return rows.filter((row): row is StoredMessage => !!row?.message && typeof row.message.messageId === 'string' && typeof row.message.sequence === 'number');
+            return rows.map((row: unknown): StoredMessage => {
+                if (!row || typeof row !== 'object' || !('message' in row) || !('status' in row) ||
+                    typeof row.status !== 'string' || !['pending', 'sent', 'forwarded', 'queued', 'delivered', 'failed', 'received'].includes(row.status) ||
+                    Object.keys(row).some(key => !['message', 'status', 'queuedUntil'].includes(key)) ||
+                    'queuedUntil' in row && (!Number.isSafeInteger(row.queuedUntil) || Number(row.queuedUntil) <= 0))
+                    throw new Error('invalid stored message');
+                return { message: parseMessage(row.message), status: row.status as MessageStatus, ...('queuedUntil' in row ? { queuedUntil: Number(row.queuedUntil) } : {}) };
+            });
         }
         catch {
             throw new Error('Lịch sử cục bộ bị hỏng. Hãy xuất dữ liệu trước khi đặt lại storage.');
@@ -30,6 +37,8 @@ export class WebStore implements DirectChatStore {
         const index = rows.findIndex((r) => r.message.messageId === row.message.messageId &&
             r.message.receiverId === row.message.receiverId &&
             r.message.senderId === row.message.senderId);
+        if (index >= 0 && !sameMessageEvent(rows[index].message, row.message))
+            throw new Error('conflicting message ID');
         if (index >= 0)
             rows[index] = row;
         else

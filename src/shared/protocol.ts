@@ -3,6 +3,7 @@ export const peerIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{3,32}$/);
 export const idSchema = z.string().uuid();
 export const MAX_CHAT_ATTACHMENTS = 3;
 export const MAX_CHAT_ATTACHMENT_BYTES = 512 * 1024;
+export const MAX_DELIVERY_ATTEMPTS = 3;
 export const chatAttachmentSchema = z
     .object({
     id: z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/),
@@ -34,7 +35,7 @@ export const messageSchema = z
     receiverId: peerIdSchema,
     groupId: idSchema.nullish(),
     type: z.enum(["text", "attachment", "ack", "file-chunk"]),
-    timestamp: z.number().int().positive(),
+    timestamp: z.number().int().positive().safe(),
     body: z.string().max(4000),
     attachments: z
         .array(chatAttachmentSchema)
@@ -42,13 +43,23 @@ export const messageSchema = z
         .max(MAX_CHAT_ATTACHMENTS)
         .optional(),
     mode: z.enum(["DIRECT", "RELAY", "TURN"]),
+    ackRequested: z.boolean().optional(),
     ackFor: idSchema.optional(),
-    attempt: z.number().int().min(1).max(4),
-    sequence: z.number().int().nonnegative(),
-    logicalTime: z.number().int().nonnegative().optional(),
+    attempt: z.number().int().min(1).max(MAX_DELIVERY_ATTEMPTS),
+    sequence: z.number().int().nonnegative().safe(),
+    logicalTime: z.number().int().nonnegative().safe().optional(),
     fileChunk: fileChunkSchema.optional(),
 })
+    .strict()
     .superRefine((m, ctx) => {
+    if (m.ackRequested !== undefined && m.ackRequested !== (m.type !== 'ack'))
+        ctx.addIssue({ code: 'custom', message: 'ackRequested must match the message type' });
+    if (m.type === 'ack' && m.ackFor === m.messageId)
+        ctx.addIssue({ code: 'custom', message: 'ACK cannot acknowledge itself' });
+    if (m.type !== 'ack' && m.ackFor !== undefined)
+        ctx.addIssue({ code: 'custom', message: 'ackFor is only supported on ACK messages' });
+    if (m.type === 'ack' && m.body.length)
+        ctx.addIssue({ code: 'custom', message: 'ack cannot have a body' });
     if (m.type === 'file-chunk' && (!m.fileChunk || m.groupId != null || m.attachments || m.body))
         ctx.addIssue({ code: 'custom', message: 'invalid file chunk envelope' });
     if (m.type !== 'file-chunk' && m.fileChunk)
@@ -70,6 +81,15 @@ export const messageSchema = z
         ctx.addIssue({ code: "custom", message: "ack cannot have attachments" });
 });
 export type ChatMessage = z.infer<typeof messageSchema>;
+function messageEvent(input: ChatMessage) {
+    const message = messageSchema.parse(input);
+    return JSON.stringify([message.messageId, message.sessionId, message.senderId, message.receiverId,
+        message.groupId ?? null, message.type, message.timestamp, message.logicalTime ?? null,
+        message.sequence, message.body, message.attachments ?? null, message.fileChunk ?? null, message.ackFor ?? null]);
+}
+export function sameMessageEvent(left: ChatMessage, right: ChatMessage): boolean {
+    return messageEvent(left) === messageEvent(right);
+}
 export type DeliveryMode = ChatMessage["mode"];
 export type PeerPresence = {
     peerId: string;
@@ -121,7 +141,11 @@ export const MAX_WIRE_BYTES = 8192;
 export function parseMessage(input: unknown): ChatMessage {
     if (BufferLikeSize(input) > MAX_WIRE_BYTES)
         throw new Error("message too large");
-    return messageSchema.parse(input);
+    const message = messageSchema.parse(input);
+    const normalized = { ...message, ackRequested: message.type !== 'ack' };
+    if (BufferLikeSize(normalized) > MAX_WIRE_BYTES)
+        throw new Error('message too large');
+    return normalized;
 }
 function BufferLikeSize(input: unknown): number {
     return new TextEncoder().encode(JSON.stringify(input)).length;

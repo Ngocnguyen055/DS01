@@ -20,10 +20,12 @@ export class PeerClient {
     private signal?: Socket;
     private relays = new Map<string, Socket>();
     private activeRelay?: string;
+    private relayWaiters = new Set<() => void>();
     private signalState: 'connecting' | 'online' | 'reconnecting' | 'offline' = 'offline';
     private reconnectTimer?: ReturnType<typeof setTimeout>;
     private refreshTimer?: ReturnType<typeof setInterval>;
     private registration?: Promise<void>;
+    private cancelConnect?: (error: Error) => void;
     private files: FileTransfer;
     private peers: string[] = [];
     private groups = new Map<string, Group>();
@@ -32,6 +34,10 @@ export class PeerClient {
     private heartbeat?: ReturnType<typeof setInterval>;
     private closed = false;
     forceRelay: boolean;
+    disconnectDirect(peerId: string) {
+        peerIdSchema.parse(peerId);
+        return !this.closed && this.directTransport.disconnect(peerId);
+    }
     constructor(private config: PeerConfig) {
         this.peerId = config.peerId;
         this.forceRelay = !!config.forceRelay;
@@ -40,6 +46,7 @@ export class PeerClient {
             rtc: config.rtc,
             iceServers: config.iceServers,
             timeoutMs: config.directTimeoutMs,
+            policy: config.rtcPolicy,
             sendSignal: (to, kind, data) => this.sendSignal(to, kind, data),
             onMessage: (raw, expectedSender, route) => {
                 void this.receive(raw, route, expectedSender);
@@ -88,7 +95,28 @@ export class PeerClient {
         this.emit({ kind: "log", text });
     }
     private connection() {
+        for (const check of this.relayWaiters) check();
         this.emit({ kind: 'connection', connection: { signaling: this.signalState, relays: [...this.relays.values()].filter(socket => socket.connected).length, activeRelay: this.activeRelay } });
+    }
+    private async waitForRelay() {
+        if (this.closed) throw new Error('peer disconnected');
+        if ([...this.relays.values()].some(socket => socket.connected)) return;
+        this.log('waiting for outbound relay connection');
+        await new Promise<void>((resolve, reject) => {
+            const finish = (error?: Error) => {
+                clearTimeout(timer);
+                this.relayWaiters.delete(check);
+                if (error) reject(error);
+                else resolve();
+            };
+            const check = () => {
+                if (this.closed) finish(new Error('peer disconnected'));
+                else if ([...this.relays.values()].some(socket => socket.connected)) finish();
+            };
+            const timer = setTimeout(() => finish(new Error('relay connection timeout')), this.config.requestTimeoutMs ?? 4000);
+            this.relayWaiters.add(check);
+            check();
+        });
     }
     getOnlinePeers() {
         return [...this.peers];
@@ -109,18 +137,20 @@ export class PeerClient {
         return peer;
     }
     private async call(socket: Socket, event: string, payload: unknown): Promise<Ack> {
+        if (this.closed || !socket.connected) throw new Error('connection unavailable');
         return await new Promise((resolve, reject) => {
             socket
-                .timeout(4000)
+                .timeout(this.config.requestTimeoutMs ?? 4000)
                 .emit(event, payload, (error: Error | null, result: Ack) => error ? reject(error) : resolve(result));
         });
     }
     async connect() {
-        if (this.started)
+        if (this.started || this.closed)
             throw new Error('Create a new PeerClient after closing a session');
         this.started = true;
         this.closed = false;
         await this.delivery.recover();
+        if (this.closed) throw new Error('peer disconnected');
         this.signalState = 'connecting';
         this.connection();
         this.signal = io(this.config.signalUrl, {
@@ -129,6 +159,7 @@ export class PeerClient {
         });
         let ready!: () => void, fail!: (error: Error) => void;
         const initial = new Promise<void>((resolve, reject) => { ready = resolve; fail = reject; });
+        this.cancelConnect = fail;
         const timer = setTimeout(() => fail(new Error('signaling timeout')), 8000);
         this.signal.on('connect', () => {
             void this.register().then(ready).catch(error => {
@@ -173,9 +204,12 @@ export class PeerClient {
         this.signal.connect();
         try {
             await initial;
+            if (this.closed) throw new Error('peer disconnected');
         }
+        catch (error) { this.close(); throw error; }
         finally {
             clearTimeout(timer);
+            this.cancelConnect = undefined;
         }
         this.heartbeat = setInterval(() => {
             if (this.signal?.connected)
@@ -302,6 +336,7 @@ export class PeerClient {
             this.log(`${mode} SEND ${packet.messageId} -> ${packet.receiverId}`);
         }
         else {
+            await this.waitForRelay();
             let failure = 'relay unavailable';
             const candidates = [...this.relays].sort(([a], [b]) => Number(b === this.activeRelay) - Number(a === this.activeRelay));
             for (const [url, socket] of candidates) {
@@ -343,12 +378,7 @@ export class PeerClient {
         return this.files.send(receiverId, name, mime, data);
     }
     async retry(messageId: string, receiverId: string) {
-        const row = (await this.config.store.list()).find(row => row.message.messageId === messageId && row.message.receiverId === receiverId && row.message.senderId === this.peerId);
-        if (!row || row.status !== 'failed' || row.message.type !== 'text')
-            throw new Error('message cannot be retried');
-        if (!row.message.groupId && await this.config.store.isDirectBlocked?.(receiverId))
-            throw new Error('peer blocked');
-        return this.delivery.send(receiverId, row.message.body, row.message.groupId, messageId, row.message.sequence);
+        return this.delivery.retry(messageId, receiverId);
     }
     async sendGroup(groupId: string, body: string): Promise<Record<string, string>> {
         return this.delivery.sendGroup(groupId, body);
@@ -359,6 +389,7 @@ export class PeerClient {
     }
     close() {
         this.closed = true;
+        this.cancelConnect?.(new Error('peer disconnected'));
         if (this.heartbeat)
             clearInterval(this.heartbeat);
         if (this.refreshTimer)
@@ -372,6 +403,7 @@ export class PeerClient {
         for (const socket of this.relays.values())
             socket.disconnect();
         this.relays.clear();
+        this.activeRelay = undefined;
         this.signalState = 'offline';
         this.connection();
     }

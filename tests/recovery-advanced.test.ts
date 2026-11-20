@@ -65,7 +65,7 @@ describe('recovery and adversarial inputs', () => {
         const store=new MemoryStore();let attempts=0;let delivery!:MessageDelivery;
         delivery=new MessageDelivery({peerId:'peer-a',store,ackTimeoutMs:10,getGroup:()=>undefined,syncProjectGroup:async()=>{throw Error('unused');},authorizeGroup:async()=>{throw Error('unused');},selectMode:async()=>'RELAY',emit:()=>{},log:()=>{},transport:async packet=>{
             attempts++;await new Promise(resolve=>setTimeout(resolve,40));
-            await delivery.receive({...packet,type:'ack',body:'',messageId:randomUUID(),senderId:'peer-b',receiverId:'peer-a',ackFor:packet.messageId},'RELAY');
+            await delivery.receive({...packet,type:'ack',body:'',messageId:randomUUID(),senderId:'peer-b',receiverId:'peer-a',ackFor:packet.messageId,ackRequested:false},'RELAY');
         }});
         await delivery.sendDirect('peer-b','slow transport, valid ACK');expect(attempts).toBe(1);expect(store.rows[0].status).toBe('delivered');delivery.close();
     });
@@ -147,7 +147,7 @@ describe('recovery and adversarial inputs', () => {
         expect(store.rows[0].status).toBe('failed');
         store.rows[0].status = 'sent';
         let resumed!: MessageDelivery;
-        resumed = new MessageDelivery({ ...config, transport: async (packet) => { await resumed.receive({ ...packet, type: 'ack', body: '', messageId: randomUUID(), senderId: 'peer-b', receiverId: 'peer-a', ackFor: packet.messageId }, 'RELAY'); } });
+        resumed = new MessageDelivery({ ...config, transport: async (packet) => { await resumed.receive({ ...packet, type: 'ack', body: '', messageId: randomUUID(), senderId: 'peer-b', receiverId: 'peer-a', ackFor: packet.messageId, ackRequested: false }, 'RELAY'); } });
         await resumed.sendDirect('peer-b', 'after restart');
         expect(store.rows.map(row => row.status)).toEqual(['failed', 'delivered']);
         expect(store.rows[1].message.sequence).toBe(2);

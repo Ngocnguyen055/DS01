@@ -12,7 +12,7 @@ function Avatar({ name, online, group = false }: {
     online?: boolean;
     group?: boolean;
 }) { return <span className={`avatar ${group ? 'group-avatar' : ''}`}>{group ? <Icon name="users"/> : name.slice(0, 2).toLocaleUpperCase()}{online !== undefined && <i className={online ? 'online' : ''}/>}</span>; }
-const statusLabel: Record<string, string> = { pending: 'Đang chuẩn bị', sent: 'Đang chờ nhận', delivered: 'Đã nhận', failed: 'Chưa gửi được', received: 'Đã nhận' };
+const statusLabel: Record<string, string> = { pending: 'Đang chuẩn bị', queued: 'Relay đã lưu · chờ peer online', sent: 'Đã gửi · chờ xác nhận', forwarded: 'Đã chuyển tiếp · chờ xác nhận', delivered: 'Đã nhận', failed: 'Chưa xác nhận', received: 'Đã nhận' };
 const connectionLabel = { offline: 'Chưa kết nối', connecting: 'Đang kết nối', reconnecting: 'Đang kết nối lại', online: 'Đang trực tuyến' };
 const clock = (time: number) => new Date(time).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
 export function App() {

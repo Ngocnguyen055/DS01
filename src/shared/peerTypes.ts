@@ -1,8 +1,9 @@
 import type { ChatAttachment, ChatMessage, DeliveryMode, Group, PeerProfile } from "./protocol.ts";
-export type MessageStatus = "pending" | "sent" | "delivered" | "failed" | "received";
+export type MessageStatus = "pending" | "sent" | "forwarded" | "queued" | "delivered" | "failed" | "received";
 export type StoredMessage = {
     message: ChatMessage;
     status: MessageStatus;
+    queuedUntil?: number;
 };
 export type DirectChatContact = {
     peerId: string;
@@ -74,5 +75,7 @@ export type PeerConfig = {
     iceServers?: RTCIceServer[];
     directTimeoutMs?: number;
     ackTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    rtcPolicy?: RTCIceTransportPolicy;
     onEvent: (event: PeerEvent) => void;
 };
