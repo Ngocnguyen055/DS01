@@ -1,66 +1,49 @@
-# Kế hoạch kiểm thử DS01
+# Ma trận kiểm thử và đánh giá
 
-> Luồng mặc định hiện dùng tài khoản: xem [authentication.md](authentication.md). Để chạy nguyên các ca dùng `peer-a/peer-b/peer-c` bên dưới, chọn **Thử nghiệm kỹ thuật bằng Peer ID**. Với tài khoản mới, đăng ký/đăng nhập rồi thay ID trong kịch bản bằng `user_<username>`.
+Tài liệu mô tả mục tiêu, bất biến và cách kiểm tra. Kết quả của các đợt đã chạy nằm ở [implementation-status.md](implementation-status.md) và hồ sơ validation; bảng kế hoạch không tự được tính thành một lần chạy.
 
-Hướng dẫn thao tác từng bước, script protocol và bảng ghi kết quả nằm trong [MANUAL-ACCEPTANCE.md](MANUAL-ACCEPTANCE.md) và [manual-results.csv](manual-results.csv). Các trạng thái dưới đây không thay thế kết quả chạy thực tế của từng buổi kiểm thử.
+## Mục 9: bộ kịch bản tối thiểu
 
-## Ma trận bắt buộc
+| ID | Loại | Thao tác | Bất biến/tiêu chí |
+|---|---|---|---|
+| F1 | Functional | A/B/C đăng ký và discovery | ID riêng, metadata đúng, không lộ secret |
+| F2 | Functional | A lookup B | Đúng online/connectivity và quyền truy cập |
+| F3 | Functional | Chat DIRECT | ACK, cùng ID, relay không FORWARD |
+| F4 | Functional | Kết nối trực tiếp lỗi | Tự dùng RELAY và nhận ACK |
+| F5 | Functional | Tạo nhóm A/B/C | Fan-out tới từng thành viên |
+| F6 | Functional | Thêm/xóa member | Version và quyền cùng cập nhật |
+| F7 | Functional | Reload peer | Giữ identity/history phù hợp |
+| F8 | Functional | Gửi file | Đúng byte/hash và trạng thái |
+| C1 | Concurrency | Hai change cùng version | Một kết quả hợp lệ, stale bị từ chối |
+| C2 | Concurrency | B/C gửi gần đồng thời | Không mất/trùng, sequence theo sender |
+| E1 | Fault/recovery | Peer mất kết nối rồi trở lại | Presence, reconnect, giữ history |
+| E2 | Fault/recovery | Relay dừng/không trả RPC | Timeout, failover hoặc failed có giới hạn |
+| S1 | Security | Token khác sender | Reject, không FORWARD |
+| S2 | Invalid data | Payload/ID/size/ACK sai | Reject, process còn hoạt động |
+| P1 | Performance | Nhiều peer/concurrent messages | Throughput, latency, success, trùng/sai đích |
 
-| ID | Loại | Thao tác | Kết quả mong đợi | Trạng thái hiện tại |
-|---|---|---|---|---|
-| F1 | Chức năng | Đăng ký A/B/C | Ba Peer ID online và duy nhất | Tự động đạt; cần ảnh demo |
-| F2 | Chức năng | A lookup B | Trả đúng online/connection | Tự động đạt |
-| F3 | Chức năng | A gửi B bằng DIRECT | B nhận, ACK; relay không FORWARD cùng ID | Có browser WebRTC local thật; WAN cần thử riêng |
-| F4 | Chức năng | Đóng DIRECT đã mở | Tự chuyển RELAY, có FORWARD và ACK | Có browser local thật |
-| F5 | Chức năng | A tạo nhóm A/B/C và gửi | B/C nhận; ACK riêng | Tự động đạt; cần ảnh demo |
-| F6 | Chức năng | Thêm/xóa C | Membership nhất quán; C không nhận tin mới sau khi xóa | Tự động đạt |
-| F7 | Chức năng | Tải lại peer | Lịch sử localStorage được khôi phục | Có browser thật |
-| F8 | Chức năng | Peer offline | Báo offline/failed, không hứa giao lại | Tự động một phần; cần demo |
-| C1 | Đồng thời | Hai peer sửa nhóm với cùng version | Một thành công, một stale/rejected | Tự động đạt |
-| C2 | Đồng thời | B và C gửi nhóm gần đồng thời | Không mất/trùng; thứ tự hợp lý từng sender | Browser local và regression ordering; tiếp tục demo thủ công |
-| E1 | Lỗi/phục hồi | Tắt C đột ngột rồi mở lại | Presence đổi; lịch sử cũ còn; tin mới gửi được | Cần demo |
-| E2 | Lỗi/phục hồi | Tắt relay khi DIRECT cũng mất | Tin failed; relay mở lại nhận tin mới | Cần demo |
-| S1 | Bảo mật | Giả `senderId` khác token | Relay REJECT, không FORWARD | Tự động đạt |
-| S2 | Dữ liệu sai | Body >4000, ID/schema sai | Bị từ chối | Tự động đạt |
-| P1 | Hiệu năng | 100 relay envelope tuần tự | In count, p50, p95, max và môi trường | Có kết quả localhost cũ; nên chạy lại |
+## B4 và các tình huống biên
 
-## Lệnh tự động
+- Mất data/mất ACK: retry cùng ID, tối đa 3 lần; một bản nhận.
+- ACK sai session/group/sequence/sender/receiver/ackFor: không hoàn tất pending khác.
+- Hai sự kiện đồng thời dùng cùng ID: không tạo hai nội dung cho một sự kiện.
+- Receive đang lưu chậm: ACK của chiều gửi vẫn được xử lý.
+- Timestamp lùi/arrival đảo thứ tự: chuỗi sender/session vẫn đúng sequence.
+- Quota/storage lỗi: không ACK như đã lưu thành công; retry không làm trùng.
+- Close/reload khi pending: lời gọi kết thúc và lịch sử phục hồi thành trạng thái có ý nghĩa.
 
-```powershell
-npm.cmd run typecheck
-npm.cmd run lint
-npm.cmd test
-npm.cmd run build:web
-```
+## Các tầng kiểm tra
 
-Test tự động sử dụng Socket.IO server thật trên cổng động. Test fallback dùng RTC giả lập cố tình không mở DataChannel, vì môi trường unit test không chứng minh NAT/WebRTC thực tế.
+Unit/integration kiểm tra schema, consistency và Socket.IO/HTTP server thật. RTC giả ở một số test chỉ dùng để chủ động gây timeout/lỗi.
 
-## Thiết bị và mạng
+Browser kiểm tra Chrome thật, WebRTC, IndexedDB và UI. Bộ nâng cao có STUN/TURN lab, E2EE/media, DHT và account recovery.
 
-### Mức 1: một máy
+Thí nghiệm hiệu năng localhost tách hai phép đo: nhận envelope Socket.IO và ACK/persistence trong Chrome. Không so trực tiếp latency của hai định nghĩa khác nhau.
 
-- Ba browser profile.
-- Signaling, relay và web chạy local.
-- Dùng để chứng minh discovery, WebRTC localhost, RELAY ép, nhóm và log.
+## Lệnh
 
-### Mức 2: hai mạng
+Bộ lệnh nền: npm run typecheck, npm run lint, npm test, npm run build:web.
 
-- Signaling/relay/web qua HTTPS/WSS công khai.
-- Một peer Wi-Fi, một peer 4G hoặc Wi-Fi khác.
-- Dùng để chứng minh NAT, DIRECT timeout tự nhiên hoặc RELAY qua Internet.
+Bản tích hợp có npm run evaluate, npm run test:browser, npm run test:browser:advanced và npm run test:browser:accounts. Các script/dependency tương ứng cần được hợp nhất cùng source của chúng.
 
-Nút ép RELAY là bằng chứng logic lựa chọn đường truyền, không phải bằng chứng NAT thật.
-
-## Bằng chứng cần lưu
-
-- Commit hash và ngày giờ.
-- Phiên bản Node, browser, OS.
-- Video ba peer discovery/group.
-- Ảnh Message ID, DIRECT và trạng thái ACK.
-- Log relay không có `FORWARD` cho ID DIRECT.
-- Log `RELAY SEND`/`FORWARD` cùng ID.
-- Video peer tắt/khởi động lại và lịch sử khôi phục.
-- Video relay dừng/phục hồi.
-- Output benchmark thật.
-
-Chỉ ghi `passed` cho tình huống đã chạy. Tình huống chưa có thiết bị hoặc URL công khai ghi `not run`.
+Mỗi hồ sơ ghi thời gian, source snapshot, môi trường, input, kết quả và bất biến. manual-results.csv giữ ô kết quả để người thực hiện ghi PASS/FAIL cùng bằng chứng của buổi chạy.

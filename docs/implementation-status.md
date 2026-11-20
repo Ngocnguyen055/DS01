@@ -1,50 +1,46 @@
-# Trạng thái khắc phục và nghiệm thu
+# Phiên bản và kết quả đối chiếu
 
-Các phát hiện trước sửa nằm trong `DS01-REVIEW.md`; file đó là lịch sử, không phải kết luận cho mã hiện tại. Các kết quả dưới đây gắn với working tree được kiểm thử, chưa phải release đã có đóng góp/duyệt của cả nhóm.
+Cập nhật 20/11/2026. Tài liệu dùng chung cho nhóm Nam/Hồng/Ngọc.
 
-| Vấn đề / yêu cầu | Cách xử lý | Kiểm chứng |
+## Phạm vi nguồn
+
+| Snapshot | Phạm vi |
+|---|---|
+| main 60867fe | Baseline GitHub tại thời điểm đối chiếu |
+| Nam 8677e28 | Baseline cộng 16 file/hunk B2/B4 |
+| Working tree tích hợp | Bản phát triển đầy đủ tại thư mục DS01, gồm phần của các thành viên và advanced |
+| Bản tài liệu dùng chung | Được cập nhật trên Nam để review cùng B2/B4 vào main |
+
+Đây là những snapshot khác nhau. Việc một tính năng có trong working tree không tự đưa source của tính năng đó vào commit B2/B4. Các phần mở rộng và CI/CD cần được commit/hợp nhất theo phân công.
+
+## Kết quả kiểm tra
+
+| Đợt | Kết quả | Phạm vi |
 |---|---|---|
-| Tài khoản và phiên | Đăng ký, scrypt/salt, đăng nhập, Peer ID cố định, tự online, restore/logout và thu hồi relay token | accounts.test.ts + browser ba tài khoản; xem authentication.md |
-| Callback sai làm chết server | Guard middleware và kiểm tra callback từng handler; rate budget, log REJECT | Regression test server vẫn trả health và RPC hợp lệ |
-| Giả sender / người ngoài nhóm / schema sai | JWT + sender binding, membership và schema/size validation | services/protocol tests, manual-probe validation |
-| Danh tính mất sau restart | Hash registry snapshot; không reset file lỗi | Restart với secret khác bị từ chối; file hỏng startup lỗi |
-| Nhóm mất sau restart | Snapshot trước update/ACK | Regression + browser restart giữ membership |
-| Owner rời nhóm gây kẹt | Chuyển owner có thứ tự xác định, archive nhóm rỗng; giới hạn 16 khi add | Regression owner mới thêm được thành viên |
-| Thiếu display name | Registration, profiles và contact cache | Browser ba phiên hiển thị tên |
-| Ordering timestamp/UUID sai | Sequence/session recovery + logical time + merge chuỗi sender | Equal-clock/reversed arrival regression |
-| Ngắt khi đợi ACK gây treo | Cancel/reject, đánh dấu failed; recover interrupted rows | Regression send kết thúc, không sent mãi |
-| UI báo Online sai khi mất mạng | Connection events và reconnect cho cả server-forced disconnect | Browser thấy reconnecting rồi tự online sau restart |
-| Không mở lịch sử offline | Danh sách từ contact/history; giữ nhóm cũ read-only | UI/sidebar và persisted stores |
-| Lưu contact đồng thời mất dữ liệu | Serialize contact writes | Regression ba contact song song không mất |
-| Log thiếu thời gian | ISO timestamp + service/event | Output dịch vụ và peer log export |
-| Phá DIRECT thật | Chờ selected ICE route, đóng PC rồi fallback | Browser WebRTC thật; cùng nội dung được ACK qua relay |
-| File nâng cao | Chunk/ACK/retry, SHA-256, IndexedDB, tiến trình/download | 512 KiB integration; 32 KiB browser, full byte/hash |
-| Relay dự phòng | Kết nối chung pool, failover transport và dedup | Dừng primary, giao tin/file qua backup |
-| TURN nâng cao | ICE config + phân biệt selected relay candidate | Code/config có; TURN public chưa chạy |
-| Hiệu năng | Script 20 simulated peers / 200 concurrent messages / 8 workers | Kết quả thật trong load-relay.json, phạm vi headless local |
-| Giao diện | Layout mới desktop/mobile, search, dark mode, nhóm/file/log | Browser smoke, ảnh chụp desktop/mobile |
+| B2/B4 đã tách | 78 test đạt | Protocol, ICE, ACK/retry/dedup/ordering và fallback |
+| Toàn bộ baseline Nam | 118/120 test đạt | Hai lỗi công cụ cũng tái hiện trên main baseline |
+| Evaluate tích hợp 20/11, 23:26 | 247/247 test, 23 file | Windows, Node v25.2.1 |
+| Ma trận mục 9 | 8 functional, 3 concurrency, 3 fault, 3 security đạt | Chọn kịch bản trong đợt evaluate |
+| Browser cơ bản | 54/54 check đạt | Chrome, WebRTC/IndexedDB thật, loopback |
+| Browser advanced | 19/19 check đạt | TURN/STUN lab, E2EE, media, mailbox và DHT |
+| Browser account recovery | 16/16 check đạt | Context/origin riêng, takeover, vault, history/file |
+| Thử tải | 3/20/50/100 peer; 60/200/500/1000 message | Socket.IO localhost, kiểm tra đúng đích/nguyên envelope |
 
-## Chạy lại
+Browser/load chạy trên working tree ngày 20/11 với base commit 60867fe và fingerprint riêng trong hồ sơ. Evaluate mới có base 8677e28 với working tree modified. Không gắn những kết quả này cho một clean checkout khác.
 
-```powershell
-npm.cmd run typecheck
-npm.cmd run lint
-npm.cmd test
-npm.cmd run build:web
-npm.cmd run test:browser
-```
+Hai test công cụ ở baseline Nam: phát hiện relay gửi nhầm socket trong load experiment; benchmark tới endpoint không hoạt động phải kết thúc hữu hạn. Các sửa đổi công cụ đã nằm trong phần tích hợp, cần đưa cùng phần N8/runtime của nhóm.
 
-- `browser-smoke.json` chỉ ghi PASS khi chạy được; lỗi runtime không được thay bằng số liệu giả.
-- Browser script dùng process/port/profile tạm, không dừng server bạn đang dùng. Chrome thử nghiệm dùng `--no-sandbox` trong môi trường local hạn chế; không dùng profile này để duyệt Internet.
-- Các JSON `review-*` và benchmark.txt cũ là bằng chứng bản trước; kết quả mới tách file, không sửa lại lịch sử.
-- `docs/manual-results.csv` là bảng người dùng tự nghiệm thu, giữ NOT RUN cho ca chưa tự chạy; không tự điền PASS chỉ dựa trên tên tính năng.
+## Các cơ chế chính
 
-## Những phần không thể thay bằng mã nguồn
+- B1/B3: tài khoản/phiên, discovery, lease, mapping, validation và log.
+- B2: SDP/ICE/DataChannel, giới hạn negotiation, selected route và fallback.
+- B4: schema strict, ACK ràng buộc context, 3 attempt, ID bất biến, dedup, recovery và ordering.
+- B5/B6: membership/OCC, fan-out/ACK từng người nhận, UI và storage tách tài khoản.
+- Advanced: pool/selection/failover, replica/mailbox, E2EE, DHT/election, file/media.
+- D1: workflow verify, build/publish image, manual deploy, health check và rollback image.
 
-1. Endpoint public và video/log qua hai mạng/NAT hoặc miền mạng cô lập đúng đề; localhost chưa chứng minh WAN.
-2. TURN public và Docker runtime chưa được chạy trong môi trường hiện tại; Docker chưa được cài ở máy kiểm tra.
-3. Tên/MSSV, phân công và lịch sử đóng góp thật của từng thành viên; không tạo commit giả thay người khác.
-4. Giảng viên truy cập được repo private, đăng ký nhóm/đề tài, final tag/release do nhóm chốt và demo có cả nhóm.
-5. Báo cáo PDF là bản kỹ thuật dự thảo có đánh dấu thông tin nhóm/WAN cần bổ sung. Không coi là bản nộp cuối nếu các phần này còn trống.
+## Hồ sơ dùng chung
 
-Không triển khai offline store-and-forward, E2EE, voice/video, DHT, election hay signaling replication. Đây là các lựa chọn nâng cao khác, không phải điều kiện phải làm hết để đạt DS01.
+[validation-2026-11-20.json](evidence/validation-2026-11-20.json) tổng hợp từ output thật; giữ mốc thời gian, nguồn và phạm vi. [test-plan.md](test-plan.md) nêu test; [MANUAL-ACCEPTANCE.md](MANUAL-ACCEPTANCE.md) nêu thao tác; manual-results.csv dành cho biên bản từng buổi.
+
+Trước khi chốt bản nộp: điền họ tên/MSSV/lớp/giảng viên, hợp nhất phần việc của từng người, ghi biên bản demo và tạo final tag/release. Những bước chung có cả ba thành viên tham gia.

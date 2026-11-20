@@ -1,99 +1,48 @@
-# Kiến trúc DS01
+# Kiến trúc DS01 P2P Chat
 
-## Sơ đồ triển khai
+Tài liệu dùng chung ngày 20/11/2026. Mô tả bản phát triển tích hợp; phạm vi phiên bản và kết quả ở [implementation-status.md](implementation-status.md).
 
-```mermaid
-flowchart LR
-  A[Web Peer A\nlocalStorage] --> Signal[Signaling\nSocket.IO :4001]
-  B[Web Peer B\nlocalStorage] --> Signal
-  C[Web Peer C\nlocalStorage] --> Signal
-  A <-->|DIRECT\nWebRTC DataChannel| B
-  A -.->|RELAY fallback| Relay[Application Relay\nSocket.IO :4002]
-  Relay -.-> B
-  C -.-> Relay
-```
+## Thành phần và process
 
-Signaling và relay là hai process độc lập. Chúng có thể chạy trên cùng máy chủ nhưng có cổng, lifecycle và log riêng. CLI signaling lưu hash danh tính và nhóm vào atomic snapshot `.data/signaling.json`, chỉ một writer. Peer giữ outbound connection tới cùng pool tối đa bốn relay để failover.
+![Kiến trúc logic](architecture.png)
 
-## Control plane
+- Signaling: đăng ký, tài khoản/phiên, discovery, heartbeat, nhóm và trao đổi SDP/ICE.
+- Application relay: ánh xạ Peer ID → socket, kiểm tra quyền/định dạng và chuyển envelope.
+- Relay dự phòng: kết nối outbound khác, journal riêng và trao đổi replica qua mạng.
+- Web peer: một phiên người dùng, PeerClient, transport, delivery và storage riêng.
+- Web server: phục vụ giao diện. TURN là service riêng khi được cấu hình.
 
-`src/signaling` xử lý:
+Có thể xem Node PID/bộ nhớ ở Task Manager → Details, các tab/renderer ở Chrome Task Manager bằng Shift+Esc, URL/PID/log ở dashboard demo. Web peer là một thực thể ứng dụng; trình duyệt quyết định cách phân bổ renderer. Không mặc định mỗi tab luôn tương ứng đúng một OS process.
 
-- đăng ký Peer ID và cấp token relay;
-- heartbeat, timeout và danh sách online;
-- peer lookup;
-- chuyển `request`, `offer`, `answer`, `ice`;
-- tạo và cập nhật membership nhóm demo;
-- kiểm tra phiên bản khi hai peer sửa nhóm gần đồng thời.
+## Luồng dữ liệu
 
-Signaling không nhận chat body. Nó chỉ giúp hai peer tìm nhau và thiết lập kết nối.
+Signaling hỗ trợ control plane, không chuyển chat body giữa peer. Socket.IO dùng HTTP long-polling/WebSocket và kết nối outbound. DataChannel là kênh WebRTC hai chiều.
 
-## Data plane
+1. A lookup B.
+2. A/B trao đổi request/offer/answer/ICE qua signaling.
+3. Khi DataChannel mở, kiểm tra selected ICE candidate pair.
+4. Candidate không relay → DIRECT; có relay candidate → TURN.
+5. Lỗi, đóng kênh hoặc timeout → application RELAY.
+6. Receiver lưu rồi gửi ACK ứng dụng; sender cập nhật trạng thái.
 
-### DIRECT
+Thiết lập DIRECT mặc định tối đa 10 giây; cửa sổ đọc route tối đa 1,5 giây. Không suy ra TURN chỉ vì cấu hình có turn: URL. STUN hỗ trợ thu thập candidate, không bảo đảm mọi NAT cho kết nối trực tiếp.
 
-`src/shared/directTransport.ts` quản lý `RTCPeerConnection`, ICE và DataChannel ordered. Peer ID nhỏ hơn tạo offer để tránh hai bên đồng thời tạo offer. Client chờ tối đa 5 giây; khi DataChannel mở, envelope đi thẳng peer-to-peer.
+## Ranh giới lưu trữ
 
-### RELAY
+Node launcher của bản tích hợp mặc định dùng DS01-runtime/data ngoài repository; DS01_DATA_DIR cho phép chỉ định lại. Tài khoản/nhóm/khóa và mỗi relay journal có chủ sở hữu rõ ràng. Docker dùng named volume.
 
-`src/relay` xác thực token do signaling cấp, ánh xạ Peer ID sang Socket.IO connection và chuyển envelope đúng receiver. Relay kiểm tra schema, sender, mode, kích thước, membership nhóm và trạng thái online trước khi ghi `FORWARD`.
+Web dùng localStorage cho hội thoại/receipt/contacts và IndexedDB cho file/khóa. Bản sao tài khoản được mã hóa trước khi gửi lên dịch vụ lưu trữ. Không dùng state file làm bus giữa peer hoặc relay; replica đi bằng HTTP có xác thực.
 
-Relay ứng dụng đọc envelope chat và khác TURN. TURN tùy chọn qua ICE, được phân biệt nhờ selected candidate pair trong getStats; nếu không xác định được đường ICE, client đóng kết nối đó và fallback để tránh gọi sai DIRECT. Có mẫu coturn nhưng TURN public cần triển khai/kiểm thử riêng.
+## Nhất quán và độ tin cậy
 
-## Đảm bảo giao tin
+Membership dùng version/OCC tại một signaling writer. Tin có Message ID, session, sequence và logical time; retry cùng sự kiện, dedup và ACK theo receiver. Ordering giữ chuỗi sender/session rồi merge xác định, không đặt ra total order toàn hệ thống.
 
-`src/shared/messageDelivery.ts` chịu trách nhiệm:
+ACK mặc định 2 giây sau transport chấp nhận; một lượt gửi tối đa 3 lần. Failed là thiếu xác nhận, không chứng minh receiver chưa nhận. Mailbox nâng cao có queued riêng, hạn lưu và ACK cuối.
 
-- tạo Message ID, Session ID và sequence;
-- trạng thái `pending → sent → delivered` hoặc `failed`;
-- ACK do ứng dụng nhận tạo sau khi lưu tin;
-- timeout ACK 2 giây và tối đa 3 attempt;
-- chuyển lần retry sang RELAY;
-- chống hiển thị trùng bằng Message ID và sender;
-- multi-unicast nhóm với ACK riêng từng receiver.
+Nhiều relay hỗ trợ failover đường dữ liệu. Replication bất đồng bộ và election có lease có thể tạm khác khi mạng phân vùng; không phải consensus kiểu Raft. Signaling coordinator vẫn là một ranh giới khả dụng riêng.
 
-Đây là best effort với số lần truyền lại hữu hạn, ACK ứng dụng và dedup có giới hạn; không bảo đảm at-least-once khi peer luôn offline. `failed` nghĩa chưa có xác nhận trong giới hạn thử, không khẳng định receiver chưa từng nhận. Retry thủ công giữ Message ID. Không có server queue cho peer offline.
+## Topology demo
 
-Sequence/session khôi phục trước lần gửi đầu, logical time cập nhật khi nhận. `orderMessages` merge các chuỗi sender/session/conversation theo sequence, không dùng comparator không bắc cầu giữa sender khác nhau. Ngắt phiên hủy promise chờ và đánh dấu failed; pending/sent từ phiên gián đoạn cũng phục hồi thành failed.
+A trên laptop Wi-Fi, B trên điện thoại 4G/5G, C trên thiết bị hoặc browser profile riêng. Các client cùng dùng URL web/signaling/relay được cấu hình. Localhost luôn chỉ thiết bị đang mở browser.
 
-File đi theo chunk 2304 byte qua cùng ACK/retry/transport. Receiver ghép đủ, kiểm tra SHA-256 rồi lưu IndexedDB; metadata sau cùng chỉ ACK khi byte file đã có và đã kiểm chứng. Chưa có resume file qua restart.
-
-## Cấu trúc mã
-
-```mermaid
-flowchart TD
-  Main[web-peer/main.tsx] --> UI[web-peer/App.tsx]
-  UI --> Hook[web-peer/useWebPeer.ts]
-  Hook --> Facade[shared/peer.ts\nPeerClient facade]
-  Facade --> Direct[shared/directTransport.ts]
-  Facade --> Delivery[shared/messageDelivery.ts]
-  Delivery --> Store[ChatStore]
-  Store --> WebStore[web-peer/store.ts\nlocalStorage]
-  Facade --> Protocol[shared/protocol.ts]
-
-  SignalRoot[signaling/index.ts] --> PeerHandlers[peerHandlers.ts]
-  SignalRoot --> GroupHandlers[groupHandlers.ts]
-  SignalRoot --> WebRtcHandlers[webrtcHandlers.ts]
-  SignalRoot --> Maintenance[maintenance.ts]
-```
-
-`PeerClient` là facade duy nhất mà giao diện cần biết. WebRTC, delivery và persistence phụ thuộc qua interface/callback, giúp thay web peer bằng Android hoặc desktop peer mà giữ nguyên protocol.
-
-## NAT, STUN, TURN và relay ứng dụng
-
-Peer sau NAT không thể dùng trực tiếp địa chỉ riêng của nhau. ICE thu thập candidate; STUN giúp peer biết candidate phản xạ công khai và thử NAT traversal. STUN không bảo đảm mọi NAT/firewall đều cho kết nối.
-
-TURN relay packet ở tầng ICE/WebRTC và xuất hiện trong ICE candidate. Application relay Socket.IO chuyển chat envelope sau khi DataChannel thất bại. Các đường được phân biệt DIRECT (ICE không relay), TURN (DataChannel qua TURN) và RELAY (application relay). Cấu hình TURN không thay thế bằng chứng chat qua application relay.
-
-## Giới hạn
-
-- Hash danh tính và nhóm có atomic snapshot ở một signaling; chưa replication signaling.
-- Lịch sử nằm tại peer, không đồng bộ qua server.
-- Peer offline không nhận lại tin cũ.
-- Không có total order giữa nhiều sender.
-- Pool relay có failover kết nối, chưa replication/offline queue giữa relay.
-- Kết quả DIRECT và NAT phụ thuộc thiết bị, mạng và firewall thực tế.
-
-## Tài khoản local và auto-connect
-
-Luồng mặc định tạo tài khoản/đăng nhập rồi tự đăng ký peer với signaling. Peer ID user_ + username; mật khẩu scrypt với salt riêng; phiên bearer 12 giờ lưu hash tại server và token trong sessionStorage của tab. Logout thu hồi phiên và đóng peer. Relay xác minh session qua HTTP nội bộ, không đọc registry chia sẻ. Xem [authentication.md](authentication.md) cho event auth, lưu trữ, chính sách một peer online và giới hạn. Chế độ secret demo cũ nằm trong mục thử nghiệm kỹ thuật.
+Khi dùng tunnel, laptop đang chạy các process là host dịch vụ. Tunnel công khai URL; URL phiên dừng khi host hoặc tunnel dừng. Máy chủ thường trực dùng HTTPS/reverse proxy và storage bền vững theo deploy configuration.
