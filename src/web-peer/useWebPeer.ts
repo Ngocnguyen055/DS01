@@ -18,6 +18,8 @@ export function useWebPeer() {
     const [transfers, setTransfers] = useState<NonNullable<PeerEvent['transfer']>[]>([]);
     const [accountSession, setAccountSession] = useState<LoginSession | null>(null), [authBusy, setAuthBusy] = useState(!!sessionStorage.getItem(sessionKey));
     const accountRef = useRef<LoginSession | null>(null);
+    const sendLock = useRef(false);
+    const retrying = useRef(new Set<string>());
     const client = useRef<PeerClient | null>(null), store = useRef(new WebStore(initialId)), generation = useRef(0);
     const refresh = useCallback(async () => {
         const active = store.current;
@@ -30,7 +32,7 @@ export function useWebPeer() {
             setBlocked(blockedPeers);
         }
         catch (error) {
-            setError(String(error));
+            if (active === store.current) setError(String(error));
         }
     }, []);
     useEffect(() => {
@@ -142,7 +144,7 @@ export function useWebPeer() {
         }
     };
     const resetSession = () => {
-        generation.current++; client.current?.close(); client.current = null;
+        generation.current++; sendLock.current = false; retrying.current.clear(); client.current?.close(); client.current = null;
         accountRef.current = null; setAccountSession(null); sessionStorage.removeItem(sessionKey);
         setHasSession(false); setConnecting(false); setSending(false); setConnection(initialConnection); setOnline([]); setProfiles([]);
         setMessages([]); setContacts([]); setGroups([]); setBlocked([]); setTransfers([]); setModes({});
@@ -174,57 +176,54 @@ export function useWebPeer() {
         return () => clearTimeout(timer);
     }, [accountSession]);
     const send = async () => {
-        if (sending || !body.trim())
-            return;
-        const text = body;
-        setError('');
-        setSending(true);
+        if (sendLock.current || retrying.current.size || !body.trim()) return;
+        if (!client.current || !hasSession) { setError('Hãy kết nối trước khi gửi'); return; }
+        const activeClient = client.current, version = generation.current, text = body;
+        sendLock.current = true;
+        setError(''); setSending(true); setBody('');
         try {
-            if (!client.current || !hasSession)
-                throw new Error('Hãy kết nối trước khi gửi');
             if (groupTarget) {
-                const result = await client.current.sendGroup(groupTarget, text);
+                const result = await activeClient.sendGroup(groupTarget, text);
                 const failed = Object.entries(result).filter(([, status]) => status === 'rejected');
-                if (failed.length)
-                    setError(`Chưa giao được tới: ${failed.map(([id]) => id).join(', ')}`);
-            }
-            else
-                await client.current.sendDirect(target, text);
-            setBody('');
-        }
-        catch (error) {
-            setError(String(error));
-        }
-        finally {
-            setSending(false);
-            void refresh();
+                if (generation.current === version && failed.length) setError('Chưa giao được tới: ' + failed.map(([id]) => id).join(', '));
+            } else await activeClient.sendDirect(target, text);
+        } catch (error) {
+            if (generation.current === version) setError(String(error));
+        } finally {
+            if (generation.current === version) { sendLock.current = false; setSending(false); void refresh(); }
         }
     };
     const createGroup = async (name: string, members: string) => {
         if (!client.current)
             throw new Error('Hãy kết nối trước');
+        const version = generation.current;
         const group = await client.current.createGroup(members.split(',').map(value => value.trim()).filter(Boolean), name);
+        if (generation.current !== version) throw new Error('Phiên đã thay đổi');
         setGroupTarget(group.id);
         setTarget('');
         return group;
     };
     const changeGroup = async (memberId: string, action: 'add' | 'remove') => {
+        const version = generation.current;
         try {
             if (!client.current)
                 throw new Error('Hãy kết nối trước');
             await client.current.changeGroup(groupTarget, memberId, action);
         }
         catch (error) {
-            setError(String(error));
+            if (generation.current === version) setError(String(error));
         }
     };
     const openPeer = async (id: string) => {
+        const activeStore = store.current, version = generation.current;
         peerIdSchema.parse(id);
         if (id === peerId)
             throw new Error('Chọn một peer khác');
         if (client.current && connection.signaling === 'online')
             await client.current.lookupPeer(id);
-        await store.current.saveDirectContact({ peerId: id, name: profiles.find(profile => profile.peerId === id)?.displayName || contacts.find(contact => contact.peerId === id)?.name || id, email: '', updatedAt: Date.now() });
+        if (generation.current !== version) return;
+        await activeStore.saveDirectContact({ peerId: id, name: profiles.find(profile => profile.peerId === id)?.displayName || contacts.find(contact => contact.peerId === id)?.name || id, email: '', updatedAt: Date.now() });
+        if (generation.current !== version) return;
         setTarget(id);
         setGroupTarget('');
         await refresh();
@@ -235,6 +234,9 @@ export function useWebPeer() {
             client.current.forceRelay = value;
     };
     const retry = async (row: StoredMessage) => {
+        const version = generation.current, key = row.message.messageId + ':' + row.message.receiverId;
+        if (sendLock.current || retrying.current.has(key)) return;
+        retrying.current.add(key);
         try {
             if (!client.current)
                 throw new Error('Hãy kết nối trước');
@@ -242,40 +244,49 @@ export function useWebPeer() {
             await client.current.retry(row.message.messageId, row.message.receiverId);
         }
         catch (error) {
-            setError(String(error));
+            if (generation.current === version) setError(String(error));
         }
         finally {
-            setSending(false);
-            void refresh();
+            if (generation.current === version) {
+                retrying.current.delete(key);
+                setSending(retrying.current.size > 0);
+                void refresh();
+            }
         }
     };
     const sendFile = async (file: File) => {
+        if (sendLock.current || retrying.current.size) return;
+        const version = generation.current, activeClient = client.current;
+        sendLock.current = true;
         try {
-            if (!client.current || !target || groupTarget)
+            if (!activeClient || !target || groupTarget)
                 throw new Error('Chọn hội thoại cá nhân để gửi file');
             setSending(true);
             setError('');
             if (file.size > 512 * 1024)
                 throw new Error('File tối đa 512 KiB');
-            await client.current.sendFile(target, file.name, file.type, new Uint8Array(await file.arrayBuffer()));
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            if (generation.current !== version) return;
+            await activeClient.sendFile(target, file.name, file.type || 'application/octet-stream', bytes);
         }
         catch (error) {
-            setError(String(error));
+            if (generation.current === version) setError(String(error));
         }
         finally {
-            setSending(false);
-            void refresh();
+            if (generation.current === version) { sendLock.current = false; setSending(false); void refresh(); }
         }
     };
     const downloadFile = async (file: ChatAttachment) => {
+        const version = generation.current;
         try {
             const saved = await store.current.getFile(file.id);
+            if (generation.current !== version) return;
             if (!saved)
                 throw new Error('File không còn trên thiết bị này. Hãy nhờ người gửi gửi lại.');
             saveDownload(file.name, new Blob([new Uint8Array(saved.data).buffer], { type: 'application/octet-stream' }));
         }
         catch (error) {
-            setError(String(error));
+            if (generation.current === version) setError(String(error));
         }
     };
     const toggleBlock = async () => {

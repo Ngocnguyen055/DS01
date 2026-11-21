@@ -5,7 +5,8 @@ import type { SignalingContext, SignalingReply } from "./types.ts";
 import { serviceLog } from '../server-kit/runtime.ts';
 function registeredPeer(socket: Socket, context: SignalingContext) {
     const peerId = context.peerFor(socket);
-    return peerId && context.peers.get(peerId)?.socket.id === socket.id
+    const peer = peerId ? context.peers.get(peerId) : undefined;
+    return peerId && peer?.socket.id === socket.id && Date.now() - peer.lastSeen <= context.heartbeatFreshMs
         ? peerId
         : undefined;
 }

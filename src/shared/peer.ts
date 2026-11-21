@@ -2,7 +2,7 @@ import { io, type Socket } from "socket.io-client";
 import { DirectTransport, type SignalKind, type SignalPacket, } from "./directTransport.ts";
 import { MessageDelivery } from "./messageDelivery.ts";
 import { FileTransfer } from './fileTransfer.ts';
-import { peerIdSchema, peerDiscoverySchema, type ChatAttachment, type ChatMessage, type DeliveryMode, type Group, type PeerDiscovery, type PeerProfile, } from "./protocol.ts";
+import { groupSchema, peerIdSchema, peerDiscoverySchema, type ChatAttachment, type ChatMessage, type DeliveryMode, type Group, type PeerDiscovery, type PeerProfile, } from "./protocol.ts";
 import type { PeerConfig, PeerEvent } from "./peerTypes.ts";
 export type { ChatStore, DirectChatContact, DirectChatStore, MessageStatus, PeerConfig, PeerEvent, RTCFactory, StoredMessage, } from "./peerTypes.ts";
 type Ack = {
@@ -27,6 +27,7 @@ export class PeerClient {
     private files: FileTransfer;
     private peers: string[] = [];
     private groups = new Map<string, Group>();
+    private groupSnapshots = new Map<string, Group>();
     private directTransport: DirectTransport;
     private delivery: MessageDelivery;
     private heartbeat?: ReturnType<typeof setInterval>;
@@ -96,6 +97,18 @@ export class PeerClient {
     getGroups() {
         return [...this.groups.values()];
     }
+    private applyGroup(raw: unknown): Group {
+        const group = groupSchema.parse(raw), previous = this.groupSnapshots.get(group.id);
+        if (previous && previous.version >= group.version)
+            return previous;
+        this.groupSnapshots.set(group.id, group);
+        if (group.members.includes(this.peerId))
+            this.groups.set(group.id, group);
+        else
+            this.groups.delete(group.id);
+        this.emit({ kind: 'group', group });
+        return group;
+    }
     async lookupPeer(peerId: string): Promise<PeerDiscovery> {
         peerIdSchema.parse(peerId);
         if (!this.signal?.connected)
@@ -146,12 +159,9 @@ export class PeerClient {
             this.emit({ kind: "presence", peers });
         });
         this.signal.on('peer:profiles', (profiles: PeerProfile[]) => this.emit({ kind: 'presence', peers: this.peers, profiles }));
-        this.signal.on("group:update", (group: Group) => {
-            if (group.members.includes(this.peerId))
-                this.groups.set(group.id, group);
-            else
-                this.groups.delete(group.id);
-            this.emit({ kind: "group", group });
+        this.signal.on("group:update", (raw: unknown) => {
+            try { this.applyGroup(raw); }
+            catch { this.log('invalid group update'); }
         });
         this.signal.on("signal:receive", (packet: SignalPacket) => {
             void this.directTransport
@@ -203,7 +213,12 @@ export class PeerClient {
         if (this.closed)
             return;
         this.peers = response.peers || [];
-        this.groups = new Map((response.groups || []).map((group) => [group.id, group]));
+        const registeredGroups = groupSchema.array().parse(response.groups || []);
+        this.groups.clear();
+        for (const raw of registeredGroups) {
+            const group = this.applyGroup(raw);
+            if (group.members.includes(this.peerId)) this.groups.set(group.id, group);
+        }
         this.emit({ kind: "presence", peers: this.peers });
         for (const group of this.groups.values())
             this.emit({ kind: "group", group });
@@ -238,7 +253,7 @@ export class PeerClient {
         const result = await this.call(this.signal, "group:create", { members, name });
         if (!result.ok || !result.group)
             throw new Error(result.error || "group creation failed");
-        return result.group;
+        return this.applyGroup(result.group);
     }
     async syncProjectGroup(projectId: string): Promise<Group> {
         if (!this.signal?.connected)
@@ -246,9 +261,12 @@ export class PeerClient {
         const result = await this.call(this.signal, "project:group", { projectId });
         if (!result.ok || !result.group)
             throw new Error(result.error || "project group access denied");
-        this.groups.set(result.group.id, result.group);
-        this.emit({ kind: "group", group: result.group });
-        return result.group;
+        const group = this.applyGroup(result.group);
+        if (group.archived)
+            throw new Error('project archived');
+        if (group.projectId !== projectId || !group.members.includes(this.peerId))
+            throw new Error('project group access denied');
+        return group;
     }
     private async authorizeGroup(groupId: string, otherPeerId: string) {
         if (!this.signal?.connected)
@@ -259,10 +277,12 @@ export class PeerClient {
         });
         if (!result.ok || !result.group)
             throw new Error(result.error || "group access denied");
-        this.groups.set(groupId, result.group);
-        if (result.group.archived)
-            throw new Error("project archived");
-        return result.group;
+        if (result.group.id !== groupId)
+            throw new Error('group identity mismatch');
+        const group = this.applyGroup(result.group);
+        if (group.archived || !group.members.includes(this.peerId) || !group.members.includes(otherPeerId))
+            throw new Error('group access denied or archived');
+        return group;
     }
     async changeGroup(groupId: string, memberId: string, action: "add" | "remove"): Promise<Group> {
         if (!this.signal)
@@ -276,9 +296,16 @@ export class PeerClient {
             action,
             version: group.version,
         });
-        if (!result.ok || !result.group)
+        if (!result.ok || !result.group) {
+            if (result.error === 'invalid group change or stale version') {
+                try { await this.authorizeGroup(groupId, this.peerId); }
+                catch { this.log('group refresh unavailable or membership revoked'); }
+            }
             throw new Error(result.error || "group change failed");
-        return result.group;
+        }
+        if (result.group.id !== groupId)
+            throw new Error('group identity mismatch');
+        return this.applyGroup(result.group);
     }
     private async sendSignal(to: string, kind: SignalKind, data: unknown) {
         if (!this.signal?.connected)
@@ -343,12 +370,7 @@ export class PeerClient {
         return this.files.send(receiverId, name, mime, data);
     }
     async retry(messageId: string, receiverId: string) {
-        const row = (await this.config.store.list()).find(row => row.message.messageId === messageId && row.message.receiverId === receiverId && row.message.senderId === this.peerId);
-        if (!row || row.status !== 'failed' || row.message.type !== 'text')
-            throw new Error('message cannot be retried');
-        if (!row.message.groupId && await this.config.store.isDirectBlocked?.(receiverId))
-            throw new Error('peer blocked');
-        return this.delivery.send(receiverId, row.message.body, row.message.groupId, messageId, row.message.sequence);
+        return this.delivery.retry(messageId, receiverId);
     }
     async sendGroup(groupId: string, body: string): Promise<Record<string, string>> {
         return this.delivery.sendGroup(groupId, body);

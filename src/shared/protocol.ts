@@ -107,16 +107,18 @@ export const peerDiscoverySchema = z.discriminatedUnion("online", [
         .strict(),
 ]);
 export type PeerDiscovery = z.infer<typeof peerDiscoverySchema>;
-export type Group = {
-    id: string;
-    ownerId: string;
-    members: string[];
-    version: number;
-    /** Project groups are persisted in MongoDB; demo DS01 groups stay in memory. */
-    projectId?: string;
-    archived?: boolean;
-    name?: string;
-};
+export const groupSchema = z.object({
+    id: idSchema,
+    ownerId: peerIdSchema,
+    members: z.array(peerIdSchema).max(16),
+    version: z.number().int().positive(),
+    projectId: z.string().regex(/^[a-f\d]{24}$/i).optional(),
+    archived: z.boolean().optional(),
+    name: z.string().trim().min(1).max(80).optional(),
+}).strict()
+    .refine(group => new Set(group.members).size === group.members.length, 'members must be unique')
+    .refine(group => group.archived || group.members.includes(group.ownerId), 'owner must be a member');
+export type Group = z.infer<typeof groupSchema>;
 export const MAX_WIRE_BYTES = 8192;
 export function parseMessage(input: unknown): ChatMessage {
     if (BufferLikeSize(input) > MAX_WIRE_BYTES)

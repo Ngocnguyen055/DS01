@@ -5,6 +5,8 @@ type PendingAck = {
     resolve: () => void;
     reject: (error: Error) => void;
     sessionId: string;
+    groupId?: string | null;
+    sequence: number;
     timer?: ReturnType<typeof setTimeout>;
 };
 type MessageDeliveryConfig = {
@@ -23,6 +25,7 @@ type MessageDeliveryConfig = {
 /** Implements message identity, ordering, ACK/retry, deduplication and fan-out. */
 export class MessageDelivery {
     private pending = new Map<string, PendingAck>();
+    private inFlight = new Set<string>();
     private sequence = new Map<string, number>();
     private sessionIds = new Map<string, string>();
     private initialized?: Promise<void>;
@@ -61,10 +64,32 @@ export class MessageDelivery {
         })();
         return this.initialized;
     }
+    private async exclusiveSend(messageId: string, receiverId: string, operation: () => Promise<void>) {
+        this.assertOpen();
+        const key = messageId + ':' + receiverId;
+        if (this.inFlight.has(key)) throw new Error('message is already in flight');
+        this.inFlight.add(key);
+        try { await operation(); }
+        finally { this.inFlight.delete(key); }
+    }
     async send(receiverId: string, body: string, groupId?: string | null, messageId = randomUUID(), sequenceOverride?: number, attachments?: ChatAttachment[], fileChunk?: FileChunk): Promise<void> {
-        this.assertOpen();
-        await this.recover();
-        this.assertOpen();
+        return this.exclusiveSend(messageId, receiverId, async () => {
+            await this.recover();
+            this.assertOpen();
+            await this.deliver(this.createMessage(receiverId, body, groupId, messageId, sequenceOverride, attachments, fileChunk));
+        });
+    }
+    async retry(messageId: string, receiverId: string): Promise<void> {
+        return this.exclusiveSend(messageId, receiverId, async () => {
+            await this.recover();
+            const row = (await this.config.store.list()).find(row => row.message.messageId === messageId && row.message.receiverId === receiverId && row.message.senderId === this.config.peerId);
+            if (!row || row.status !== 'failed' || row.message.type !== 'text') throw new Error('message cannot be retried');
+            if (!row.message.groupId && await this.config.store.isDirectBlocked?.(receiverId)) throw new Error('peer blocked');
+            if (row.message.groupId) await this.config.authorizeGroup(row.message.groupId, receiverId);
+            await this.deliver(parseMessage(row.message));
+        });
+    }
+    private createMessage(receiverId: string, body: string, groupId: string | null | undefined, messageId: string, sequenceOverride?: number, attachments?: ChatAttachment[], fileChunk?: FileChunk): ChatMessage {
         if (!body.trim() && !attachments?.length && !fileChunk)
             throw new Error("empty message");
         if (attachments?.length && groupId)
@@ -80,7 +105,7 @@ export class MessageDelivery {
             sessionId = randomUUID();
             this.sessionIds.set(conversationKey, sessionId);
         }
-        const message = parseMessage({
+        return parseMessage({
             messageId,
             sessionId,
             senderId: this.config.peerId,
@@ -96,6 +121,10 @@ export class MessageDelivery {
             logicalTime: this.clock = Math.max(Date.now(), this.clock + 1),
             fileChunk,
         });
+    }
+    private async deliver(message: ChatMessage): Promise<void> {
+        this.assertOpen();
+        const { messageId, receiverId, fileChunk } = message;
         if (!fileChunk) {
             await this.config.store.put({ message, status: "pending" });
             this.config.emit({
@@ -118,7 +147,7 @@ export class MessageDelivery {
                 let armTimeout=()=>{};
                 const ack = new Promise<void>((resolve, reject) => {
                     const key = `${messageId}:${receiverId}`;
-                    this.pending.set(key, { resolve, reject, sessionId: message.sessionId });
+                    this.pending.set(key, { resolve, reject, sessionId: message.sessionId, groupId: message.groupId, sequence: message.sequence });
                     armTimeout=()=>{
                         const waiting=this.pending.get(key);
                         if(waiting)waiting.timer=setTimeout(()=>{this.pending.delete(key);reject(new Error('ACK timeout'));},this.config.ackTimeoutMs || 2000);
@@ -191,7 +220,7 @@ export class MessageDelivery {
             throw new Error("not a group member");
         const current = group.projectId
             ? await this.config.syncProjectGroup(group.projectId)
-            : group;
+            : await this.config.authorizeGroup(groupId, this.config.peerId);
         if (current.archived)
             throw new Error("project archived");
         const messageId = randomUUID();
@@ -200,10 +229,15 @@ export class MessageDelivery {
         const recipients = current.members.filter((peerId) => peerId !== this.config.peerId);
         if (!recipients.length)
             throw new Error('add another member before sending');
-        const results = await Promise.allSettled(recipients.map((peerId) => this.send(peerId, body, groupId, messageId, sequence)));
+        const message = this.createMessage(recipients[0], body, groupId, messageId, sequence);
+        const results = await Promise.allSettled(recipients.map(peerId => this.exclusiveSend(messageId, peerId, () => this.deliver({ ...message, receiverId: peerId }))));
         return Object.fromEntries(recipients.map((peerId, index) => [peerId, results[index].status]));
     }
     receive(raw: unknown, mode: DeliveryMode, expectedSender?: string): Promise<void> {
+        // ACKs must not wait behind an inbound message whose transport is still completing.
+        try {
+            if (parseMessage(raw).type === 'ack') return this.receiveOne(raw, mode, expectedSender);
+        } catch (error) { this.config.log('receive rejected: ' + String(error)); return Promise.resolve(); }
         const job = this.incoming.then(() => this.receiveOne(raw, mode, expectedSender));
         this.incoming = job.catch(() => { });
         return job;
@@ -226,7 +260,7 @@ export class MessageDelivery {
                 await this.config.authorizeGroup(message.groupId, message.senderId);
             if (message.type === "ack") {
                 const pending = this.pending.get(`${message.ackFor}:${message.senderId}`);
-                if (pending && pending.sessionId === message.sessionId) {
+                if (pending && pending.sessionId === message.sessionId && (pending.groupId ?? null) === (message.groupId ?? null) && pending.sequence === message.sequence) {
                     clearTimeout(pending.timer);
                     this.pending.delete(`${message.ackFor}:${message.senderId}`);
                     pending.resolve();

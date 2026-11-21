@@ -51,7 +51,7 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
     });
     const publishGroup = (group: Group) => {
         const before = groups.get(group.id);
-        if (before && before.version > group.version)
+        if (before && before.version >= group.version)
             return;
         groups.set(group.id, group);
         for (const peerId of new Set([
@@ -67,7 +67,7 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
         const current = await directory.group(id);
         if (current)
             publishGroup(current);
-        return current;
+        return current ? groups.get(current.id) || current : null;
     };
     const publishPresence = () => {
         io.to('registered-peers').emit('presence', [...peers.keys()]);
