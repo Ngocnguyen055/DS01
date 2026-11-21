@@ -1,3 +1,6 @@
+import type { CallState } from '../shared/media.ts';
+import type { GroupCallState, GroupCallRoom } from '../shared/groupCallProtocol.ts';
+import { privateCallRecord, groupCallRecord, type CallRecord } from './callHistory.ts';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { PeerClient, isDirectMessageBetween, peerIdSchema, type Group, type StoredMessage, type PeerEvent, type PeerProfile, type ChatAttachment, type DirectChatContact } from '@ds01/shared';
 import { WebStore } from './store.ts';
@@ -17,6 +20,7 @@ export function useWebPeer() {
     const [modes, setModes] = useState<Record<string, string>>({}), [messages, setMessages] = useState<StoredMessage[]>([]), [logs, setLogs] = useState<string[]>([]), [error, setError] = useState(''), [sending, setSending] = useState(false), [blocked, setBlocked] = useState<string[]>([]);
     const [transfers, setTransfers] = useState<NonNullable<PeerEvent['transfer']>[]>([]);
     const [accountSession, setAccountSession] = useState<LoginSession | null>(null), [authBusy, setAuthBusy] = useState(!!sessionStorage.getItem(sessionKey));
+    const [call, setCall] = useState<CallState>(), [groupCall, setGroupCall] = useState<GroupCallState>(), [groupCalls, setGroupCalls] = useState<GroupCallRoom[]>([]), [callStarting, setCallStarting] = useState(false), [calls, setCalls] = useState<CallRecord[]>([]);
     const accountRef = useRef<LoginSession | null>(null);
     const client = useRef<PeerClient | null>(null), store = useRef(new WebStore(initialId)), generation = useRef(0);
     const refresh = useCallback(async () => {
@@ -25,7 +29,7 @@ export function useWebPeer() {
             const [rows, savedContacts, blockedPeers] = await Promise.all([active.list(), active.listDirectContacts(), active.listDirectBlocked()]);
             if (active !== store.current)
                 return;
-            setMessages(rows);
+            setMessages(rows); setCalls(active.listCalls());
             setContacts(savedContacts);
             setBlocked(blockedPeers);
         }
@@ -62,7 +66,7 @@ export function useWebPeer() {
         setOnline([]);
         setProfiles([]);
         setModes({});
-        setTransfers([]);
+        setTransfers([]); setCall(undefined); setGroupCall(undefined); setGroupCalls([]); setCalls([]);
         try {
             peerIdSchema.parse(activeId);
             if (!activeName.trim() || activeName.trim().length > 80)
@@ -71,8 +75,9 @@ export function useWebPeer() {
             if (iceServers && (!Array.isArray(iceServers) || iceServers.some(server => !server?.urls)))
                 throw new Error('Cấu hình ICE servers không hợp lệ');
             store.current = new WebStore(activeId);
+            store.current.recoverCalls();
             await refresh();
-            const peer = new PeerClient({ peerId: activeId, displayName: activeName.trim(), identityProof: session?.token || secretFor(activeId), signalUrl, relayUrl, relayUrls, iceServers, rtc: RTCPeerConnection, store: store.current, forceRelay,
+            const peer = new PeerClient({ peerId: activeId, displayName: activeName.trim(), identityProof: session?.token || secretFor(activeId), signalUrl, relayUrl, relayUrls, iceServers, rtc: RTCPeerConnection, store: store.current, identityStore: store.current, forceRelay,
                 onEvent: event => {
                     if (generation.current !== version)
                         return;
@@ -81,6 +86,8 @@ export function useWebPeer() {
                         setError('Phiên đăng nhập đã hết hạn hoặc đã đăng xuất. Hãy đăng nhập lại.');
                         return;
                     }
+                    if (event.kind === 'call' && event.call) { setCall(event.call); const record = privateCallRecord(event.call); if (record) store.current.putCall(record); setCalls(store.current.listCalls()); }
+                    if (event.kind === 'group-call') { setGroupCall(event.groupCall); setGroupCalls(event.groupCalls || []); if (event.groupCall) { const record = groupCallRecord(event.groupCall); if (record) store.current.putCall(record); setCalls(store.current.listCalls()); } }
                     if (event.kind === 'connection' && event.connection) {
                         setConnection(event.connection);
                         if (event.connection.signaling === 'online')
@@ -146,12 +153,15 @@ export function useWebPeer() {
         accountRef.current = null; setAccountSession(null); sessionStorage.removeItem(sessionKey);
         setHasSession(false); setConnecting(false); setSending(false); setConnection(initialConnection); setOnline([]); setProfiles([]);
         setMessages([]); setContacts([]); setGroups([]); setBlocked([]); setTransfers([]); setModes({});
+        setCall(undefined); setGroupCall(undefined); setGroupCalls([]); setCallStarting(false); setCalls([]);
         setTarget(''); setGroupTarget(''); setBody(''); setLogs([]); setPeerId(''); setDisplayName('');
         store.current = new WebStore('');
     };
     const disconnect = async () => {
         setAuthBusy(true);
         try {
+            if (client.current?.media.isActive()) await client.current.media.end();
+            if (client.current?.groupMedia.isActive()) await client.current.groupMedia.leave();
             if (accountRef.current) await authRequest(signalUrl, 'auth:logout', { token: accountRef.current.token });
             resetSession();
             setError('');
@@ -303,6 +313,23 @@ export function useWebPeer() {
     const visible = messages.filter(row => groupTarget ? row.message.groupId === groupTarget : isDirectMessageBetween(row.message, peerId, target));
     const exportHistory = () => saveDownload(`ds01-${groupTarget || target || peerId}.json`, new Blob([JSON.stringify(visible, null, 2)], { type: 'application/json' }));
     const exportLogs = () => saveDownload('ds01-peer-log.txt', new Blob([logs.slice().reverse().join('\n')], { type: 'text/plain' }));
+    const startCall = async (kind: 'audio' | 'video') => {
+        setCallStarting(true);
+        try {
+            if (!client.current || !target && !groupTarget) throw Error('Chọn cuộc trò chuyện để gọi.');
+            if (groupTarget) await client.current.groupMedia.start(groupTarget, kind); else await client.current.media.start(target, kind);
+        } catch (error) { setError(String(error)); } finally { setCallStarting(false); }
+    };
+    const joinGroupCall = async (roomId: string) => { setCallStarting(true); try { await client.current?.groupMedia.join(roomId); } catch (error) { setError(String(error)); } finally { setCallStarting(false); } };
+    const leaveGroupCall = async () => { await client.current?.groupMedia.leave(); };
+    const muteGroupCall = (kind: 'audio' | 'video', muted: boolean) => client.current?.groupMedia.mute(kind, muted);
+    const resumeGroupAudio = () => client.current?.groupMedia.resumeAudio();
+    const dismissGroupCall = () => client.current?.groupMedia.dismiss();
+    const callBusy = callStarting || !!call && !['ended', 'failed'].includes(call.phase) || groupCall?.phase === 'active' || groupCall?.phase === 'joining';
+    const acceptCall = async () => { try { await client.current?.media.accept(); } catch (error) { setError(String(error)); } };
+    const endCall = async () => { await client.current?.media.end(); };
+    const muteCall = (kind: 'audio' | 'video', muted: boolean) => client.current?.media.mute(kind, muted);
+    const resumeCallAudio = () => client.current?.media.resumeAudio();
     const knownPeers = [...new Set([...online, ...contacts.map(contact => contact.peerId), ...messages.flatMap(row => row.message.groupId ? [] : [row.message.senderId, row.message.receiverId])])].filter(id => id !== peerId);
     const nameOf = (id: string) => profiles.find(profile => profile.peerId === id)?.displayName || contacts.find(contact => contact.peerId === id)?.name || (id === peerId ? displayName : id);
     let names: Record<string, string> = {};
@@ -311,5 +338,5 @@ export function useWebPeer() {
     }
     catch { /* Preserve damaged data for manual export. */ }
     const historyGroups = [...new Set(messages.map(row => row.message.groupId).filter((id): id is string => !!id))].filter(id => !groups.some(group => group.id === id)).map(id => ({ id, name: names[id] || `Nhóm ${id.slice(0, 8)}`, ownerId: peerId, members: [], version: 0, archived: true } as Group));
-    return { peerId, setPeerId, displayName, setDisplayName, accountSession, authBusy, authenticate, connection, hasSession, connecting, connected: connection.signaling === 'online', online, groups: [...groups, ...historyGroups], target, setTarget, groupTarget, setGroupTarget, body, setBody, forceRelay, modes, messages, visible, logs, error, setError, sending, blocked, transfers, knownPeers, nameOf, connect, disconnect, send, createGroup, changeGroup, openPeer, toggleForceRelay, retry, sendFile, downloadFile, toggleBlock, deleteHistory, exportHistory, exportLogs, signalUrl, relayUrls: [relayUrl, ...relayUrls] };
+    return { call, groupCall, groupCalls, callBusy, calls, joinGroupCall, leaveGroupCall, muteGroupCall, resumeGroupAudio, dismissGroupCall, startCall, acceptCall, endCall, muteCall, resumeCallAudio, dismissCall: () => setCall(undefined), peerId, setPeerId, displayName, setDisplayName, accountSession, authBusy, authenticate, connection, hasSession, connecting, connected: connection.signaling === 'online', online, groups: [...groups, ...historyGroups], target, setTarget, groupTarget, setGroupTarget, body, setBody, forceRelay, modes, messages, visible, logs, error, setError, sending, blocked, transfers, knownPeers, nameOf, connect, disconnect, send, createGroup, changeGroup, openPeer, toggleForceRelay, retry, sendFile, downloadFile, toggleBlock, deleteHistory, exportHistory, exportLogs, signalUrl, relayUrls: [relayUrl, ...relayUrls] };
 }

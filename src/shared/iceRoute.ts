@@ -3,6 +3,10 @@ export type IceRoute = {
     localType: string;
     remoteType: string;
 };
+export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+];
 
 function classify(local: unknown, remote: unknown): IceRoute | undefined {
     const types = ['host', 'srflx', 'prflx', 'relay'];

@@ -1,7 +1,7 @@
 import type { DeliveryMode } from "./protocol.ts";
 import type { RTCFactory } from "./peerTypes.ts";
 import { inspectIceRoute } from './iceRoute.ts';
-export type SignalKind = "request" | "offer" | "answer" | "ice";
+export type SignalKind = "request" | "offer" | "answer" | "ice" | "media";
 export type SignalPacket = {
     from: string;
     kind: SignalKind;

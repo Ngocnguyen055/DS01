@@ -152,6 +152,7 @@ describe("persistent project chat authorization", () => {
         token: jwt.sign(
           { sub: A },
           process.env.PEER_SECRET || "local-development-only-secret",
+          { expiresIn: '1h', audience: 'ds01-relay', issuer: 'ds01-signaling' },
         ),
       },
     });

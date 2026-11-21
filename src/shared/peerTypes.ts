@@ -39,7 +39,10 @@ export interface DirectChatStore extends ChatStore {
 }
 export type RTCFactory = new (config: RTCConfiguration) => RTCPeerConnection;
 export type PeerEvent = {
-    kind: "message" | "presence" | "group" | "mode" | "log" | "connection" | "transfer" | "auth-expired";
+    kind: "message" | "presence" | "group" | "mode" | "log" | "connection" | "transfer" | "auth-expired" | "call" | "group-call";
+    call?: import('./media.ts').CallState;
+    groupCall?: import('./groupCallProtocol.ts').GroupCallState;
+    groupCalls?: import('./groupCallProtocol.ts').GroupCallRoom[];
     message?: StoredMessage;
     peers?: string[];
     group?: Group;
@@ -76,6 +79,9 @@ export type PeerConfig = {
     directTimeoutMs?: number;
     ackTimeoutMs?: number;
     requestTimeoutMs?: number;
+    encryption?: boolean;
+    identityStore?: import('./secure.ts').IdentityStore;
+    mediaDevices?: Pick<MediaDevices, 'getUserMedia'>;
     rtcPolicy?: RTCIceTransportPolicy;
     onEvent: (event: PeerEvent) => void;
 };

@@ -1,3 +1,9 @@
+import { SecureChannel, publicIdentitySchema } from './secure.ts';
+import { MediaSession } from './media.ts';
+import { GroupMediaSession } from './groupMedia.ts';
+import { RelayMedia } from './relayMedia.ts';
+import type { MediaFrame, MediaLink } from './mediaProtocol.ts';
+import type { GroupCallContext } from './groupCallProtocol.ts';
 import { io, type Socket } from "socket.io-client";
 import { DirectTransport, type SignalKind, type SignalPacket, } from "./directTransport.ts";
 import { MessageDelivery } from "./messageDelivery.ts";
@@ -13,6 +19,11 @@ type Ack = {
     groups?: Group[];
     group?: Group;
     peer?: PeerDiscovery;
+    key?: unknown;
+    queued?: boolean;
+    expiresAt?: number;
+    rooms?: import('./groupCallProtocol.ts').GroupCallRoom[];
+    room?: import('./groupCallProtocol.ts').GroupCallRoom;
 };
 export class PeerClient {
     private started = false;
@@ -33,6 +44,9 @@ export class PeerClient {
     private delivery: MessageDelivery;
     private heartbeat?: ReturnType<typeof setInterval>;
     private closed = false;
+    readonly secure: SecureChannel;
+    readonly media: MediaSession;
+    readonly groupMedia: GroupMediaSession;
     forceRelay: boolean;
     disconnectDirect(peerId: string) {
         peerIdSchema.parse(peerId);
@@ -41,6 +55,36 @@ export class PeerClient {
     constructor(private config: PeerConfig) {
         this.peerId = config.peerId;
         this.forceRelay = !!config.forceRelay;
+        this.secure = new SecureChannel(config.peerId, async peerId => {
+            if (!this.signal?.connected) throw Error('security key directory unavailable');
+            const response = await this.call(this.signal, 'key:lookup', peerId);
+            if (!response.ok) throw Error(response.error || 'security key unavailable');
+            return publicIdentitySchema.parse(response.key);
+        }, config.identityStore);
+        const mediaOptions = { rtc: config.rtc, iceServers: config.iceServers, policy: config.rtcPolicy, devices: config.mediaDevices,
+            prepare: async () => {
+                if (config.encryption) return;
+                if (!this.signal?.connected) throw Error('signaling unavailable');
+                const response = await this.call(this.signal, 'key:publish', await this.secure.publicIdentity());
+                if (!response.ok) throw Error(response.error || 'cannot publish call security key');
+            },
+            cipher: (peerId: string, callId: string) => this.secure.mediaCipher(peerId, callId), log: (text: string) => this.log(text) };
+        this.media = new MediaSession({ ...mediaOptions, busy: () => this.groupMedia?.isActive(),
+            relay: (peerId, callId) => this.openMediaRelay(peerId, callId),
+            send: (to, data) => this.sendSignal(to, 'media', data), emit: call => this.emit({ kind: 'call', call }) });
+        this.groupMedia = new GroupMediaSession({ peerId: this.peerId, devices: config.mediaDevices, busy: () => this.media.isActive(),
+            control: async input => {
+                if (!this.signal?.connected) throw Error('Cuộc gọi nhóm cần kết nối signaling.');
+                const response = await this.call(this.signal, 'group-call:control', input);
+                if (!response.ok) throw Error(response.error || 'group call unavailable');
+                return response;
+            },
+            create: (_peerId, scope, stream, context, emit) => new MediaSession({ ...mediaOptions, stream: async () => stream,
+                driver: options => new RelayMedia(options, context),
+                relay: (peerId, callId) => this.openMediaRelay(peerId, callId, { groupId: scope.groupId, roomId: scope.roomId }),
+                send: (to, data) => this.sendSignal(to, 'media', { ...data, group: scope }), emit }),
+            emit: (groupCall, groupCalls) => this.emit({ kind: 'group-call', groupCall, groupCalls }), log: text => this.log(text),
+        });
         this.directTransport = new DirectTransport({
             peerId: this.peerId,
             rtc: config.rtc,
@@ -182,14 +226,18 @@ export class PeerClient {
                 this.groups.set(group.id, group);
             else
                 this.groups.delete(group.id);
+            this.groupMedia.membership(group);
             this.emit({ kind: "group", group });
         });
+        this.signal.on('group-call:update', (raw: unknown) => { if (!this.closed) try { this.groupMedia.update(raw); } catch { this.log('invalid group call roster'); } });
         this.signal.on("signal:receive", (packet: SignalPacket) => {
+            if (packet.kind === 'media') { void this.receiveMedia(packet.from, packet.data); return; }
             void this.directTransport
                 .receiveSignal(packet)
                 .catch((error: unknown) => this.log(`signal error: ${String(error)}`));
         });
         this.signal.on('disconnect', reason => {
+            this.groupMedia.offline();
             this.log(`signaling disconnected: ${reason}`);
             this.signalState = this.closed ? 'offline' : 'reconnecting';
             this.peers = [];
@@ -236,6 +284,10 @@ export class PeerClient {
             throw new Error(response.error || "registration failed");
         if (this.closed)
             return;
+        if (this.config.encryption) {
+            const published = await this.call(this.signal, 'key:publish', await this.secure.publicIdentity());
+            if (!published.ok) throw Error(published.error || 'cannot publish security key');
+        }
         this.peers = response.peers || [];
         this.groups = new Map((response.groups || []).map((group) => [group.id, group]));
         this.emit({ kind: "presence", peers: this.peers });
@@ -254,6 +306,7 @@ export class PeerClient {
             socket.on("relay:receive", (raw: unknown) => {
                 void this.receive(raw, "RELAY");
             });
+            socket.on('media:frame', (frame: unknown) => { this.media.receiveFrame(frame); this.groupMedia.receiveFrame(frame); });
             socket.on('connect', () => { if(!this.activeRelay || url===this.config.relayUrl.replace(/\/$/,''))this.activeRelay=url; this.log('relay connected'); this.connection(); });
             socket.on('disconnect', () => {
                 if (this.activeRelay === url)
@@ -263,6 +316,7 @@ export class PeerClient {
             });
             socket.on('connect_error', error => { this.log(`relay error: ${error.message}`); this.connection(); });
         }
+        void this.groupMedia.refresh().catch(error => this.log('group call discovery: ' + String(error)));
         this.signalState = 'online';
         this.connection();
     }
@@ -325,10 +379,10 @@ export class PeerClient {
         if (!result.ok)
             throw new Error(result.error || "signal rejected");
     }
-    private async transport(message: ChatMessage, mode: DeliveryMode): Promise<void> {
-        const packet = { ...message, mode };
-        // Control plane checks contain IDs only; chat content remains on DataChannel/relay.
-        // Recheck each retry/ACK, even when a DataChannel is already open.
+    private async transport(message: ChatMessage, mode: DeliveryMode): Promise<void | { queued: true; expiresAt?: number }> {
+        const packet = this.config.encryption ? await this.secure.seal({ ...message, mode }) : { ...message, mode };
+
+
         if (packet.groupId)
             await this.authorizeGroup(packet.groupId, packet.receiverId);
         if (mode === "DIRECT" || mode === 'TURN') {
@@ -351,7 +405,7 @@ export class PeerClient {
                     this.activeRelay = url;
                     this.connection();
                     this.log(`RELAY SEND ${packet.messageId} -> ${packet.receiverId} via ${url}`);
-                    return;
+                    return response.queued ? { queued: true, expiresAt: response.expiresAt } : undefined;
                 }
                 catch (error) {
                     failure = String(error);
@@ -384,11 +438,66 @@ export class PeerClient {
         return this.delivery.sendGroup(groupId, body);
     }
     /** Single inbound boundary kept here so tests can inject a forged transport packet. */
-    private receive(raw: unknown, mode: DeliveryMode, expectedSender?: string) {
-        return this.delivery.receive(raw, mode, expectedSender);
+    private async receive(raw: unknown, mode: DeliveryMode, expectedSender?: string) {
+        try {
+            const message = this.config.encryption ? await this.secure.open(raw) : raw as ChatMessage;
+            await this.delivery.receive(message, mode, expectedSender);
+            if (mode === 'RELAY' && message && typeof message === 'object') {
+                const rows = await this.config.store.list();
+                const accepted = message.type === 'ack' ? rows.some(row => row.message.messageId === message.ackFor && row.message.receiverId === message.senderId && row.status === 'delivered')
+                    : rows.some(row => row.message.messageId === message.messageId && row.message.senderId === message.senderId && row.status === 'received');
+                if (accepted) await Promise.allSettled([...this.relays.values()].filter(socket => socket.connected).map(socket => this.call(socket, 'relay:consumed', { messageId: message.messageId, senderId: message.senderId })));
+            }
+        } catch (error) { this.log(`secure receive rejected: ${String(error)}`); }
+    }
+    private async openMediaRelay(peerId: string, callId: string, group?: GroupCallContext): Promise<MediaLink> {
+        await this.waitForRelay();
+        let stopped = false, refreshing = false;
+        const opened = new Set<Socket>(), input = { callId, to: peerId, ...(group ? { group } : {}) };
+        const refresh = async () => {
+            if (stopped || refreshing) return;
+            refreshing = true;
+            try {
+                await Promise.allSettled([...this.relays.values()].filter(socket => socket.connected).map(async socket => {
+                    try {
+                        const response = await this.call(socket, 'media:open', input);
+                        if (stopped) { if (response.ok) void this.call(socket, 'media:close', input).catch(() => {}); return; }
+                        if (response.ok) opened.add(socket); else opened.delete(socket);
+                    } catch { opened.delete(socket); }
+                }));
+            } finally { refreshing = false; }
+        };
+        await refresh();
+        if (!opened.size || this.closed) {
+            stopped = true;
+            for (const socket of opened) void this.call(socket, 'media:close', input).catch(() => {});
+            throw Error('Không mở được relay cuộc gọi. Cần khởi động lại demo để cập nhật relay.');
+        }
+        const timer = setInterval(() => { void refresh(); }, 5000);
+        return {
+            send: (frame: MediaFrame) => {
+                if (stopped || this.closed) return false;
+                const preferred = this.activeRelay && this.relays.get(this.activeRelay);
+                const socket = preferred && opened.has(preferred) && preferred.connected ? preferred : [...opened].find(socket => socket.connected);
+                if (!socket || socket.io.engine.writeBuffer.length > (frame.kind === 'audio' ? 16 : 2)) return false;
+                if (frame.kind === 'video') socket.volatile.emit('media:frame', frame);
+                else socket.emit('media:frame', frame);
+                return true;
+            },
+            close: () => { if (stopped) return; stopped = true; clearInterval(timer); for (const socket of opened) void this.call(socket, 'media:close', input).catch(() => {}); opened.clear(); },
+        };
+    }
+    private async receiveMedia(from: string, data: unknown) {
+        try {
+            if (this.closed || await this.config.store.isDirectBlocked?.(from)) return;
+            if (data && typeof data === 'object' && 'group' in data) await this.groupMedia.receive(from, data);
+            else await this.media.receive(from, data);
+        }
+        catch (error) { this.log(`media signal rejected: ${String(error)}`); }
     }
     close() {
         this.closed = true;
+        this.media.close(); this.groupMedia.close();
         this.cancelConnect?.(new Error('peer disconnected'));
         if (this.heartbeat)
             clearInterval(this.heartbeat);

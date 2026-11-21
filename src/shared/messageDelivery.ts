@@ -164,6 +164,7 @@ export class MessageDelivery {
         }
         this.config.emit({ kind: "mode", peerId: receiverId, mode });
         let lastAccepted = message;
+        let lastFailure = '';
         for (let attempt = 1; attempt <= MAX_DELIVERY_ATTEMPTS; attempt++) {
             const packet = { ...message, mode, attempt };
             try {
@@ -229,7 +230,8 @@ export class MessageDelivery {
                     clearTimeout(pending.timer);
                     this.pending.delete(`${messageId}:${receiverId}`);
                 }
-                this.config.log(`send attempt ${attempt} failed: ${String(error)}`);
+                lastFailure = String(error);
+                this.config.log(`send attempt ${attempt} failed: ${lastFailure} peer=${receiverId} message=${messageId} type=${message.type}`);
                 if (this.closed)
                     break;
                 mode = "RELAY";
@@ -243,7 +245,7 @@ export class MessageDelivery {
                 message: { message: lastAccepted, status: "failed" },
             });
         }
-        throw new Error(`delivery failed to ${receiverId}`);
+        throw new Error(`delivery failed to ${receiverId}${lastFailure ? ": " + lastFailure : ""}`);
     }
     async sendDirect(receiverId: string, body: string): Promise<void> {
         peerIdSchema.parse(receiverId);
