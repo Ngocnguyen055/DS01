@@ -1,15 +1,11 @@
-# Copy OUTSIDE the repository to /etc/turnserver.conf and replace every placeholder.
 listening-port=3478
 fingerprint
 lt-cred-mech
 realm=turn.example.org
 user=ds01-lab:REPLACE_WITH_RANDOM_LAB_PASSWORD
-# external-ip=PUBLIC_IP/PRIVATE_IP
 min-port=49160
 max-port=49200
 no-multicast-peers
 no-cli
 no-tls
 no-dtls
-# This lab sample serves TURN over UDP/TCP 3478, NOT TURNS.
-# Configure cert/pkey and tls-listening-port separately for TURNS in your deployment.

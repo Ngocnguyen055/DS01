@@ -1,4 +1,6 @@
-import { isDirectMessageBetween, peerIdSchema, type DirectChatContact, type DirectChatStore, type StoredMessage, type MessageStatus, type ChatAttachment, orderMessages, } from "@ds01/shared";
+import { callRecordSchema, recoverCallRecords, type CallRecord } from './callHistory.ts';
+import { publicIdentitySchema, type DeviceIdentity, type PublicIdentity } from '../shared/secure.ts';
+import { isDirectMessageBetween, parseMessage, peerIdSchema, sameMessageEvent, type DirectChatContact, type DirectChatStore, type StoredMessage, type MessageStatus, type ChatAttachment, orderMessages, } from "@ds01/shared";
 export class WebStore implements DirectChatStore {
     private contactWrites = Promise.resolve();
     constructor(private scope: string) { }
@@ -16,7 +18,14 @@ export class WebStore implements DirectChatStore {
             const rows: unknown = JSON.parse(localStorage.getItem(this.key) || "[]");
             if (!Array.isArray(rows))
                 throw new Error('invalid history');
-            return rows.filter((row): row is StoredMessage => !!row?.message && typeof row.message.messageId === 'string' && typeof row.message.sequence === 'number');
+            return rows.map((row: unknown): StoredMessage => {
+                if (!row || typeof row !== 'object' || !('message' in row) || !('status' in row) ||
+                    typeof row.status !== 'string' || !['pending', 'sent', 'forwarded', 'queued', 'delivered', 'failed', 'received'].includes(row.status) ||
+                    Object.keys(row).some(key => !['message', 'status', 'queuedUntil'].includes(key)) ||
+                    'queuedUntil' in row && (!Number.isSafeInteger(row.queuedUntil) || Number(row.queuedUntil) <= 0))
+                    throw new Error('invalid stored message');
+                return { message: parseMessage(row.message), status: row.status as MessageStatus, ...('queuedUntil' in row ? { queuedUntil: Number(row.queuedUntil) } : {}) };
+            });
         }
         catch {
             throw new Error('Lịch sử cục bộ bị hỏng. Hãy xuất dữ liệu trước khi đặt lại storage.');
@@ -30,6 +39,8 @@ export class WebStore implements DirectChatStore {
         const index = rows.findIndex((r) => r.message.messageId === row.message.messageId &&
             r.message.receiverId === row.message.receiverId &&
             r.message.senderId === row.message.senderId);
+        if (index >= 0 && !sameMessageEvent(rows[index].message, row.message))
+            throw new Error('conflicting message ID');
         if (index >= 0)
             rows[index] = row;
         else
@@ -153,6 +164,42 @@ export class WebStore implements DirectChatStore {
             return new Set();
         }
     }
+    listCalls(): CallRecord[] {
+        return callRecordSchema.array().parse(JSON.parse(localStorage.getItem(`${this.key}-calls`) || '[]'));
+    }
+    putCall(input: CallRecord) {
+        const record = callRecordSchema.parse(input), records = this.listCalls(), index = records.findIndex(call => call.id === record.id);
+        if (index >= 0 && JSON.stringify(records[index]) === JSON.stringify(record)) return false;
+        if (index >= 0) records[index] = record; else records.push(record);
+        localStorage.setItem(`${this.key}-calls`, JSON.stringify(records.sort((a, b) => a.startedAt - b.startedAt).slice(-1000)));
+        return true;
+    }
+    recoverCalls() {
+        const records = recoverCallRecords(this.listCalls());
+        for (const record of records) this.putCall(record);
+    }
+    private async security(key: string, value?: unknown): Promise<unknown> {
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+            const request = indexedDB.open('ds01-security-v1', 1);
+            request.onupgradeneeded = () => request.result.createObjectStore('keys');
+            request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+        });
+        try {
+            return await new Promise((resolve, reject) => {
+                const tx = db.transaction('keys', value === undefined ? 'readonly' : 'readwrite'), store = tx.objectStore('keys');
+                const request = value === undefined ? store.get(`${this.scope}:${key}`) : store.put(value, `${this.scope}:${key}`);
+                let result: unknown;
+                request.onsuccess = () => { result = request.result; };
+                tx.oncomplete = () => resolve(result); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || Error('security key storage failed'));
+            });
+        } finally { db.close(); }
+    }
+    async getIdentity() { return await this.security('identity') as DeviceIdentity | undefined; }
+    async putIdentity(value: DeviceIdentity) { await this.security('identity', value); }
+    async getAccountKeys() { return await this.security('account-keys') as { vaultId: string; key: CryptoKey } | undefined; }
+    async putAccountKeys(vaultId: string, key: CryptoKey) { await this.security('account-keys', { vaultId, key }); }
+    async getPin(peerId: string) { const value = await this.security(`pin:${peerId}`); return value ? publicIdentitySchema.parse(value) : undefined; }
+    async putPin(peerId: string, value: PublicIdentity) { await this.security(`pin:${peerId}`, publicIdentitySchema.parse(value)); }
     private async files(): Promise<IDBDatabase> {
         return new Promise((resolve, reject) => {
             const request = indexedDB.open('ds01-files-v1', 1);

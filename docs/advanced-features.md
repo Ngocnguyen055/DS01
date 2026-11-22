@@ -1,86 +1,51 @@
-# Tính năng nâng cao
+# Chức năng nâng cao DS01
 
-## 1. Gửi file thật qua các đường truyền
+Mô tả cơ chế trong bản phát triển tích hợp. Bảng kết quả và phiên bản tham chiếu nằm ở [implementation-status.md](implementation-status.md).
 
-- Chat cá nhân → nút `+` cạnh ô soạn tin → chọn file 1 byte–512 KiB.
-- Chia thành chunk 2304 byte, base64 tối đa 3072 ký tự/chunk, vẫn giữ giới hạn envelope 8192 byte.
-- Mỗi chunk có Message ID và ACK/retry riêng, được gửi DIRECT, TURN hoặc application RELAY như tin nhắn.
-- Metadata gồm transferId/index/total/name/mime/size/SHA-256. Kiểm tra số chunk, kích thước, nội dung chunk trùng và hash toàn file.
-- Chỉ lưu IndexedDB sau khi xác minh; notification attachment sau cùng chỉ ACK nếu byte file đã có. Không ACK thành công giả khi file thiếu sau reload hoặc có hash sai.
-- Trên UI có tiến trình và nút tải về. File được tải như dữ liệu, không tự thực thi HTML/SVG.
+| Chức năng 5.11 | Thành phần chính | Cơ chế |
+|---|---|---|
+| Nhiều relay | PeerClient, relay | Pool tối đa bốn URL khác nhau |
+| Chọn relay | relaySelection | RTT EWMA + peer count + pending mail |
+| Tự failover | PeerClient | Disconnect/RPC timeout, thử relay khác |
+| Bầu super-peer | RelayCluster, journal | Owner Peer ID, endpoint, lease, merge ứng viên |
+| Replication | cluster, journal | HTTP xác thực, snapshot riêng, tombstone |
+| Store-and-forward | journal, MessageDelivery | TTL, queued, ACK người nhận |
+| E2EE | secure, keyDirectory | ECDH/HKDF/AES-GCM và identity pin |
+| DHT | overlayProtocol, cluster | Signed record, hash ring và owner replica |
+| Truyền file | FileTransfer | Chunk, ACK, SHA-256, IndexedDB |
+| STUN | DirectTransport | Binding và ICE candidate gathering |
+| WebRTC/TURN | DirectTransport, iceRoute | Selected candidate pair và route label |
+| Thoại/video | MediaSession, CallPanel | Nhận cuộc gọi, RTP, mute, hangup |
+| Load test | load-relay, browser-smoke | Concurrency, latency, throughput, đúng socket/envelope |
 
-Thử: gửi file qua DIRECT, đóng DIRECT rồi gửi file khác qua RELAY; tải cả hai và so SHA-256. `tests/recovery-advanced.test.ts` truyền/so toàn bộ 512 KiB; `npm run test:browser` kiểm tra file 32 KiB trong browser/IndexedDB thật. Sau reload vẫn tải được file đã hoàn thành.
+## Chọn relay và failover
 
-Giới hạn: chưa gửi file nhóm, chưa resume transfer đang dở sau restart, chưa E2EE. Assembly tối đa 4 transfer, bỏ bản dở sau 2 phút; transfer integrity lỗi không được chấp nhận lại ngay với cùng ID. Người dùng có thể chọn file gửi lại thành transfer mới.
+RTT được làm mượt theo 0,7 × giá trị cũ + 0,3 × mẫu mới. Điểm bằng RTT + 0,25 × peers + 2 × pending. Mẫu hết hạn sau 45 giây; relay hiện tại có độ ưu tiên giữ ổn định. Chiến lược Thứ tự ưu tiên dùng thứ tự URL.
 
-## 2. Nhiều application relay và failover
+Failover của pool là đổi đường truyền. Nó không tự sao chép state; mailbox/journal replica là cơ chế riêng. Replica bất đồng bộ có cửa sổ trước khi write lan sang node khác.
 
-Terminal relay chính: `npm run start:relay` (4002).
+## Super-peer và DHT
 
-Terminal relay dự phòng, cùng secret và signaling:
+Một browser không tự trở thành server public. Ứng viên cần relay đồng hành có owner Peer ID đúng, nằm trong cluster và endpoint hợp lệ. Tại Kết nối nâng cao → Ứng cử super-peer, người dùng gửi URL relay đồng hành. Lease loại ứng viên cũ; log ELECTION_CANDIDATE/ELECTION_RESULT giúp đối chiếu.
 
-```powershell
-$env:RELAY_PORT='4003'
-npm.cmd run start:relay
-```
+DHT dùng identity từ khóa ký, record có chữ ký/thời hạn và relay overlay theo hash ring. Cấu hình thành viên ring cần thống nhất. Đây là nguyên mẫu discovery phân tán, không phải Kademlia hoặc consensus Raft.
 
-Trong `.env` trước khi chạy Vite/build:
+## Mailbox và E2EE
 
-```env
-VITE_RELAY_URL=http://localhost:4002
-VITE_RELAY_URLS=http://localhost:4003
-```
+Peer offline có thể nhận queued khi mailbox được bật; không coi queued là delivered. Receipt cuối phụ thuộc ACK người nhận. Hạn lưu mặc định 24 giờ, có giới hạn dung lượng và trạng thái hết hạn.
 
-Mọi peer phải dùng cùng pool. Tối đa 4 URL khác nhau; không trỏ hai alias tới cùng một relay instance. Client giữ kết nối outbound tới pool và thử relay còn kết nối khi gửi; cùng Message ID được giữ khi cần truyền lại. Cả hai bên phải cùng kết nối được ít nhất một relay còn sống.
+E2EE bảo vệ plaintext; relay vẫn thấy routing metadata và ciphertext. Key pin, account vault và cơ chế thay khóa được dùng cùng luồng tài khoản. TLS bảo vệ transport, giải quyết một lớp khác.
 
-Thử: bật ưu tiên relay, gửi thành công, dừng relay chính, đợi bảng kết nối còn 1 relay rồi gửi tin/file mới. Receiver vẫn ACK, chỉ có một bản tin; log relay dự phòng phải có đúng ID. Có test integration và browser cho ca này.
+## File, STUN/TURN và media
 
-Đây là failover đường truyền, không phải consensus hoặc replication state. Signaling vẫn là điểm lỗi đơn. Không có hàng đợi offline hoặc tự di chuyển dữ liệu giữa relay.
+File tối đa 512 KiB, chunk 2304 byte, kiểm tra SHA-256 trước hoàn thành. Resume file dang dở qua restart là hướng mở rộng.
 
-## 3. ICE/STUN/TURN và cách gọi đúng đường truyền
+Cấu hình ICE đi qua VITE_ICE_SERVERS; VITE_ICE_POLICY điều khiển policy của bản tích hợp. TURN service và application relay độc lập. Giao diện báo TURN theo selected pair, không theo việc có URL TURN trong cấu hình.
 
-Client nhận `VITE_ICE_SERVERS` dạng JSON tại build time. Ví dụ khi đã có coturn của nhóm:
+Cuộc gọi chỉ xin quyền media ở bước người dùng chấp nhận; mute thay đổi track và hangup dừng track. Bài kiểm tra lab sử dụng STUN/TURN và audio/video RTP thật.
 
-```env
-VITE_ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":["turn:turn.example.org:3478?transport=udp","turn:turn.example.org:3478?transport=tcp"],"username":"ds01-lab","credential":"REPLACE_WITH_LAB_PASSWORD"}]
-```
+## Công cụ của bản tích hợp
 
-TURN credentials trong cấu hình này được gửi tới browser, không phải secret chỉ dành cho server. Dùng credential lab có quota/thời hạn phù hợp; PEER_SECRET và JWT_SECRET không bao giờ đặt vào VITE_*.
+npm run test:browser:advanced kiểm tra TURN, media, replica mailbox và DHT bằng Chrome thật. npm run test:browser:accounts kiểm tra recovery tài khoản. npm run evaluate chạy test và ma trận mục 9. Các script này được đưa cùng phần code tích hợp tương ứng.
 
-| UI / envelope | Ý nghĩa |
-|---|---|
-| DIRECT | DataChannel với ICE candidate pair không có relay candidate |
-| TURN | DataChannel có selected relay candidate, đi qua TURN |
-| RELAY | Chat envelope qua application relay Socket.IO |
-
-Client kiểm tra getStats trước khi báo DataChannel ready; nếu không xác định được selected route thì fallback thay vì tuyên bố DIRECT. TURN kết nối được không đồng nghĩa đã chứng minh DIRECT P2P không qua server.
-
-`deploy/turnserver.conf.example` là cấu hình lab, không chứa credential thật. Copy ra ngoài repo, điền realm/user/password/public IP, chạy coturn trên server nhóm kiểm soát; mở 3478 TCP/UDP và dải relay 49160–49200 UDP theo cấu hình. Mẫu chưa bật TURNS; muốn TURNS phải cấu hình chứng chỉ và cổng TLS riêng. Các tùy chọn được đối chiếu với [mẫu cấu hình chính thức coturn](https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf).
-
-**Chưa chạy một coturn public thật trong môi trường này.** Hãy ghi NOT RUN cho nghiệm thu TURN/WAN tới khi có endpoint và log thực tế.
-
-## 4. Lưu bền và phục hồi
-
-CLI signaling ghi atomic snapshot hash danh tính và nhóm. Server restart không giải phóng quyền sở hữu Peer ID cho secret khác và không xóa nhóm. Dữ liệu hỏng làm startup báo lỗi thay vì âm thầm reset registry.
-
-Mỗi file chỉ có một signaling writer; không dùng cùng file làm giao tiếp giữa nhiều process. Trong Docker dùng named volume riêng signaling. Backup file, giữ secret và giới hạn quyền truy cập; không commit `.data/`.
-
-Client khôi phục sequence/session từ lịch sử; interrupted pending/sent thành failed. Retry text giữ Message ID. Group owner rời nhóm chuyển cho ID nhỏ nhất còn lại; nhóm hết người archived.
-
-## 5. Tải đồng thời
-
-```powershell
-npm.cmd run load:relay -- --peers 20 --messages 10 --concurrency 8 --signal http://localhost:4001 --relay http://localhost:4002
-```
-
-Script đăng ký nhiều headless peer, giữ heartbeat và gửi đồng thời theo vòng. Kết quả có requested/delivered/failed/duplicate, success rate, throughput, p50/p95/max và ước tính payload bytes.
-
-Giới hạn lab: 3–100 peer, 1–100 tin/peer, 1–50 worker. Đây là simulated peers trong một process tạo tải, không phải một máy cho mỗi peer. Latency kết thúc khi recipient Socket.IO nhận envelope; không đo app ACK, browser storage, WebRTC hay WAN. Payload bytes không gồm toàn bộ overhead TCP/TLS/Socket.IO.
-
-`npm run test:browser` cũng chạy phép đo 20 peer, 200 tin, 8 worker trên relay dự phòng local và ghi `docs/evidence/load-relay.json`. Giữ source fingerprint/commit, môi trường và phạm vi đo khi đưa số vào báo cáo; không gọi số localhost là Internet latency.
-
-## 6. Giao diện và tiện ích
-
-Mạch có danh sách hội thoại gồm cả peer offline, tên hiển thị, tên nhóm, search, bubble nhóm gộp fan-out nhưng giữ trạng thái riêng từng receiver ở Chi tiết, retry, chặn peer, tải file, xuất lịch sử/log, dark mode và mobile layout.
-
-Ưu tiên relay nằm trong Tình trạng kết nối, ghi rõ đó là chọn route, không mô phỏng NAT. Không hiển thị delivered như đã đọc, không gọi transport encryption là E2EE. History export không chứa identity proof/token.
+Khi demo advanced, chọn từng chức năng, chỉ ra state trước/sau, ID sự kiện và log liên quan; không dùng số lượng tên tính năng thay cho giải thích cơ chế.

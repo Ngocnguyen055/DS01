@@ -1,70 +1,46 @@
-# Tài khoản và tự kết nối peer
+# Tài khoản, phiên và dữ liệu
 
-Luồng mặc định: **Tạo tài khoản → Đăng nhập → Tự đăng ký peer với signaling → Vào chat**. Đăng ký tài khoản không tự tạo phiên đăng nhập. Sau khi đăng ký, biểu mẫu chuyển về đăng nhập và giữ tên đăng nhập vừa tạo.
+Tài liệu cho bản phát triển tích hợp ngày 20/11/2026; các extension cần đi cùng source/dependency của chúng khi hợp nhất.
 
-## Chạy và demo
+## Tài khoản và Peer ID
 
-Tại thư mục dự án, mở ba terminal:
+Người dùng tạo tài khoản hoặc đăng nhập; tên đăng nhập được chuẩn hóa và gắn Peer ID ổn định dạng user_<username>. Sau xác thực, web tự đăng ký peer. Display name dùng để hiển thị, không thay định danh.
 
-```powershell
-npm.cmd run start:signaling
-```
+Mật khẩu được băm scrypt với salt riêng. Server lưu hash mật khẩu và hash token phiên. Phiên mặc định 12 giờ; logout thu hồi phiên. Relay kiểm tra token/subject và hiệu lực phiên qua giao tiếp dịch vụ, không đọc chung file tài khoản để trao đổi state.
 
-```powershell
-npm.cmd run start:relay
-```
+Một tài khoản có ràng buộc phiên online. Ở màn hình đăng nhập, Chuyển phiên sang thiết bị này dùng cho tiếp quản có chủ đích; phiên cũ bị thu hồi/ngắt theo luồng tài khoản.
 
-```powershell
-npm.cmd run dev:web
-```
+## Dữ liệu nằm ở đâu?
 
-Mở `http://localhost:5173` bằng ba browser profile riêng. Tạo tài khoản `alice`, `bob`, `carol`, mỗi tài khoản có tên hiển thị và mật khẩu ít nhất 10 ký tự. Đăng nhập từng tài khoản. Peer ID được cấp tự động lần lượt là `user_alice`, `user_bob`, `user_carol`; không nhập Peer ID hoặc secret trong luồng tài khoản.
+| Dữ liệu | Vị trí |
+|---|---|
+| Tài khoản và hash phiên | Kho dữ liệu signaling |
+| Membership/identity registry | Snapshot signaling |
+| Journal/mailbox | Kho riêng của mỗi relay |
+| Lịch sử, receipt và contacts | localStorage theo tài khoản/origin |
+| File và khóa đang dùng | IndexedDB |
+| Bản sao tài khoản | Archive được mã hóa trước khi gửi lên server |
 
-Chọn người trong danh sách để chat. DIRECT vẫn được ưu tiên; bật relay trong Tình trạng kết nối để demo RELAY. Khi tạo nhóm bằng ID, dùng `user_bob,user_carol`. Tải lại trang trong cùng tab sẽ tự kiểm tra phiên và tham gia mạng lại. Nút Đăng xuất ở thanh trên thu hồi phiên trên server, đóng các kết nối và đưa về biểu mẫu đăng nhập.
+Launcher Node của bản tích hợp mặc định dùng DS01-runtime/data; DS01_DATA_DIR chỉ định nơi khác. Không lấy thư mục source, tài khoản browser và thư mục runtime làm ba nguồn tài khoản độc lập. Docker dùng volume theo cấu hình.
 
-## Các ca tự kiểm tra
+.env cấu hình dịch vụ và URL, không phải danh sách username/password để đăng nhập. Giữ đúng kho dữ liệu và secret qua restart/redeploy để tài khoản cũ tiếp tục dùng được.
 
-| Ca | Thao tác | Kết quả cần thấy |
-|---|---|---|
-| A01 | Đăng ký tên hợp lệ, mật khẩu >=10 ký tự và xác nhận trùng | Báo tạo thành công, chuyển sang đăng nhập; chưa online |
-| A02 | Dùng lại tên đăng nhập, kể cả đổi chữ hoa/thường | Bị từ chối; không tạo hai ID cho cùng tên |
-| A03 | Nhập sai mật khẩu | Không vào chat, báo lỗi chung cho tên/mật khẩu |
-| A04 | Đăng nhập đúng | Không cần thao tác kết nối riêng; tự online, thấy peer khác |
-| A05 | Ba tài khoản đăng nhập và chat nhóm cùng lúc | Ba ID riêng, discovery, DIRECT/RELAY, ACK và nhóm hoạt động |
-| A06 | Đăng nhập cùng tài khoản trên browser khác khi phiên cũ online | Báo tài khoản đang online; phiên cũ tiếp tục dùng được |
-| A07 | F5 trong cùng tab | Tự xác minh phiên, khôi phục ID, lịch sử và nhóm |
-| A08 | Restart signaling, giữ file state | Peer tự kết nối lại; tài khoản, quyền sở hữu và nhóm còn nguyên |
-| A09 | Đăng xuất rồi F5 | Giữ ở màn hình đăng nhập, không hiển thị hội thoại của tài khoản cũ |
-| A10 | Đăng nhập lại sau đăng xuất | Dùng lại đúng Peer ID và lịch sử trên thiết bị đó |
-| A11 | Đăng nhập tài khoản khác sau đăng xuất | Không trộn lịch sử hai Peer ID |
-| A12 | Dùng token trước đăng xuất để đăng ký lại/gửi relay | Bị từ chối; đã có integration test bằng socket thô |
+## Thiết bị mới và địa chỉ web mới
 
-Không đăng nhập đồng thời nhiều tài khoản bằng các tab của cùng profile để đánh giá tính cô lập storage. Các tab cùng origin chia sẻ localStorage/IndexedDB; dùng profile riêng cho demo nhiều người dùng.
+Browser mới/origin mới bắt đầu với storage riêng. Bản tích hợp mở vault tài khoản bằng thông tin đăng nhập, khôi phục identity, history/file đã backup và tiếp tục E2EE. Khóa đang dùng trong browser không cho xuất trực tiếp; dữ liệu khôi phục được bảo vệ trong vault.
 
-## Thiết kế và ràng buộc
+Một account có thể giữ nguyên Peer ID khi đổi thiết bị. Nhưng dữ liệu chỉ tồn tại trên browser cũ cần được đồng bộ hoặc xuất/nhập trước. Kết nối cùng một signaling không tự biến mọi localStorage thành storage chung.
 
-- Username được trim, chuyển chữ thường, dài 3–24 ký tự `[a-z0-9_-]`. Peer ID cố định là `user_` + username. Display name tối đa 80 ký tự, được server lấy từ tài khoản khi đăng ký peer.
-- Mật khẩu dài 10–128 ký tự, tối đa 256 byte UTF-8. Lưu bằng scrypt `N=131072, r=8, p=1`, salt ngẫu nhiên riêng 16 byte, hash 64 byte; dùng so sánh timing-safe. Không lưu/log mật khẩu rõ. Thông số theo [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
-- Phiên là bearer token ngẫu nhiên 32 byte, hết hạn sau 12 giờ. Server chỉ lưu SHA-256 của token. Browser dùng sessionStorage trong tab, không lưu mật khẩu. F5 giữ phiên; sau khi đóng tab có thể cần đăng nhập lại. Browser có thể khôi phục sessionStorage khi dùng chức năng khôi phục tab; hết hạn/thu hồi trên server vẫn quyết định quyền truy cập.
-- Một tài khoản có một Peer ID và tối đa một peer online. Đăng nhập mới khi peer cũ offline thay thế phiên đăng nhập cũ. Phiên đang online ở nơi khác bị từ chối. Nếu mất mạng đột ngột, có thể cần đợi heartbeat lease hết trước khi đăng nhập trên thiết bị khác.
-- Giới hạn auth theo địa chỉ kết nối (40 lần/10 phút) và username (10 lần/10 phút), giữ qua các socket mới trong cùng process. Tối đa hai tác vụ scrypt đang chạy để giới hạn RAM; trả thông báo bận cho yêu cầu vượt mức. Budget ở RAM, reset khi server restart. Sau reverse proxy, địa chỉ có thể là IP của proxy và quota IP sẽ dùng chung; cần thiết kế proxy đáng tin và rate limiting riêng khi mở cho nhiều người dùng Internet.
-- Registry tài khoản mặc định `.data/signaling.json.accounts.json`, đi cùng `.data/signaling.json` của signaling. Có thể đặt `ACCOUNT_STATE_PATH`. Ghi snapshot atomic, một writer; dữ liệu hỏng làm startup thất bại. Giữ cả hai file khi restart/backup; không chia sẻ file này làm bus giao tiếp giữa các service.
-- Signaling chỉ nhận control plane. Các event tài khoản không nhận/gửi nội dung chat. Relay kiểm tra session qua HTTP nội bộ tại handshake và khi chuyển tiếp tin tài khoản, nên token đã thu hồi không tiếp tục dùng relay. Đổi lại, chat RELAY của tài khoản phụ thuộc vào signaling để xác minh phiên; DIRECT đã thiết lập có thể tiếp tục khi signaling tạm mất mạng cho tới khi phiên bị đóng/hết hạn tại client.
-- Khi triển khai Internet, cấu hình HTTPS/WSS cho đường tài khoản/signaling; HTTP localhost chỉ dùng lab. Không gửi mật khẩu hoặc bearer token qua HTTP public. Không commit `.env`, registry hoặc token.
-- Chưa có reset mật khẩu qua email, xác minh email, MFA, quản lý nhiều thiết bị hoặc đồng bộ lịch sử qua server. Không mô tả những chức năng này là đã hoàn thành.
+Trong Tình trạng kết nối → Kết nối nâng cao, theo dõi Đồng bộ dữ liệu và dùng Đồng bộ ngay khi cần. Nhập lịch sử từ phiên bản cũ nhận JSON xuất từ origin/thiết bị cũ; không nhập file của tài khoản khác.
 
-## Protocol và code
+## Gián đoạn và khôi phục
 
-| Event Socket.IO tới signaling | Payload | Kết quả thành công |
-|---|---|---|
-| `auth:register` | `{ username, password, displayName }` | `{ ok, account }` |
-| `auth:login` | `{ username, password }` | `{ ok, account, token, expiresAt }` |
-| `auth:session` | `{ token }` | `{ ok, account, expiresAt }` |
-| `auth:logout` | `{ token }` | `{ ok }`, thu hồi token |
-| `peer:register` | `{ peerId, identityProof: token }` | Relay JWT có `sub=peerId`, `sid=hash phiên` |
+Backup outage giữ dữ liệu local và báo trạng thái chờ; khi kết nối trở lại, sync tiếp tục. Archive file được kiểm tra kích thước/hash trước khi áp dụng; lỗi quota có rollback cho dữ liệu cần ghi.
 
-Mọi lỗi có `{ ok: false, error }`. Prefix `user_` dành riêng cho tài khoản, không đăng ký được bằng secret demo. Adapter JWT/Mongo 24-hex cũ vẫn giữ để tương thích, không phải tài khoản local mới.
+Đăng xuất che dữ liệu khỏi workspace và thu hồi phiên. Việc xóa storage browser là thao tác khác với logout. Không xóa registry/volume để thử đăng nhập lại.
 
-Code: `src/signaling/accounts.ts`, `authHandlers.ts`, `peerHandlers.ts`, `src/relay/index.ts`, `src/web-peer/auth.ts`, `AuthPanel.tsx`, `useWebPeer.ts`. Kiểm thử: `tests/accounts.test.ts` và `npm.cmd run test:browser`.
+Các giới hạn cần giải thích: server vẫn giữ metadata account, E2EE không giấu routing, mất thông tin mở vault có thể ảnh hưởng khả năng khôi phục, và thiết bị bị kiểm soát có thể đọc dữ liệu sau giải mã.
 
-Chế độ cũ nằm ở **Thử nghiệm kỹ thuật bằng Peer ID** bên dưới biểu mẫu. Dùng mục này cho các kịch bản `peer-a/peer-b/peer-c` trong tài liệu cũ và mở lịch sử demo đã có. Tài khoản mới có ID khác nên không tự nhập lịch sử demo vào tài khoản.
+## Bộ kiểm tra
+
+accounts, account-recovery, discovery, security và browser-account-recovery kiểm tra mật khẩu sai, trùng tên, session revoke, takeover, archive mã hóa, đổi origin, restart và quota. Xem hồ sơ validation ngày 20/11/2026 cho số liệu của từng bộ.

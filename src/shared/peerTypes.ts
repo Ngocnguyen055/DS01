@@ -1,8 +1,9 @@
 import type { ChatAttachment, ChatMessage, DeliveryMode, Group, PeerProfile } from "./protocol.ts";
-export type MessageStatus = "pending" | "sent" | "delivered" | "failed" | "received";
+export type MessageStatus = "pending" | "sent" | "forwarded" | "queued" | "delivered" | "failed" | "received";
 export type StoredMessage = {
     message: ChatMessage;
     status: MessageStatus;
+    queuedUntil?: number;
 };
 export type DirectChatContact = {
     peerId: string;
@@ -38,7 +39,10 @@ export interface DirectChatStore extends ChatStore {
 }
 export type RTCFactory = new (config: RTCConfiguration) => RTCPeerConnection;
 export type PeerEvent = {
-    kind: "message" | "presence" | "group" | "mode" | "log" | "connection" | "transfer" | "auth-expired";
+    kind: "message" | "presence" | "group" | "mode" | "log" | "connection" | "transfer" | "auth-expired" | "call" | "group-call";
+    call?: import('./media.ts').CallState;
+    groupCall?: import('./groupCallProtocol.ts').GroupCallState;
+    groupCalls?: import('./groupCallProtocol.ts').GroupCallRoom[];
     message?: StoredMessage;
     peers?: string[];
     group?: Group;
@@ -74,5 +78,10 @@ export type PeerConfig = {
     iceServers?: RTCIceServer[];
     directTimeoutMs?: number;
     ackTimeoutMs?: number;
+    requestTimeoutMs?: number;
+    encryption?: boolean;
+    identityStore?: import('./secure.ts').IdentityStore;
+    mediaDevices?: Pick<MediaDevices, 'getUserMedia'>;
+    rtcPolicy?: RTCIceTransportPolicy;
     onEvent: (event: PeerEvent) => void;
 };

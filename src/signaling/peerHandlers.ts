@@ -89,6 +89,7 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
             }
         }
         const token = jwt.sign({ sub: peerId, ...(peerId.startsWith(LOCAL_ACCOUNT_PREFIX) ? { sid: socket.data.authSession } : {}) }, context.peerSecret, {
+            algorithm: 'HS256', audience: 'ds01-relay', issuer: 'ds01-signaling',
             expiresIn: peerId.startsWith(LOCAL_ACCOUNT_PREFIX) ? Math.max(1, Math.floor((socket.data.authExpiresAt - Date.now()) / 1000)) : 12 * 60 * 60,
         });
         serviceLog('signal', 'REGISTER', peerId);
