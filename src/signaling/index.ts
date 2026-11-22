@@ -1,4 +1,3 @@
-import { fileURLToPath } from "node:url";
 import express from "express";
 import { createServer, type Server as HttpServer } from "node:http";
 import { config as loadEnv } from "dotenv";
@@ -15,25 +14,30 @@ import { AtomicState, guardSocket, serviceLog } from '../server-kit/runtime.ts';
 import { persistedSignalSchema, type PersistedSignal } from './state.ts';
 import { Accounts } from './accounts.ts';
 import { registerAuthHandlers } from './authHandlers.ts';
+import { requireSecret } from '../server-kit/secrets.ts';
+import { onlineProfiles, peerIsOnline } from './presence.ts';
+import { KeyDirectory } from './keyDirectory.ts';
+import { projectRoot, dataRoot } from '../server-kit/storagePaths.mjs';
+import { join, dirname } from 'node:path';
+import { AccountData, registerAccountData } from './accountData.ts';
 export type { DirectChatAuthorizer } from "./types.ts";
-loadEnv({ path: fileURLToPath(new URL("../../.env", import.meta.url)) });
+if (process.env.NODE_ENV !== 'test') loadEnv({ path: join(projectRoot, '.env') });
 const HEARTBEAT_FRESH_MS = 30000;
-const PEER_SECRET = process.env.PEER_SECRET || "local-development-only-secret";
-const JWT_SECRET = process.env.JWT_SECRET || "local-development-only-secret";
-if (process.env.NODE_ENV === "production" &&
-    (!process.env.JWT_SECRET ||
-        process.env.JWT_SECRET.length < 32 ||
-        process.env.JWT_SECRET.startsWith('replace-with-') ||
-        !process.env.PEER_SECRET ||
-        process.env.PEER_SECRET.length < 32 || process.env.PEER_SECRET.startsWith('replace-with-')))
-    throw new Error("JWT_SECRET and PEER_SECRET must each be at least 32 characters in production");
-/** Builds the signaling control plane without starting a TCP listener. */
+const PEER_SECRET = requireSecret('PEER_SECRET');
+const JWT_SECRET = requireSecret('JWT_SECRET');
+if (PEER_SECRET === JWT_SECRET)
+    throw new Error('JWT_SECRET and PEER_SECRET must be different');
+
 export function createSignaling(httpServer: HttpServer = createServer(), directory: ProjectDirectory = httpProjectDirectory(), authorizeDirect: DirectChatAuthorizer = createHttpDirectChatAuthorizer(PEER_SECRET), options: {
     statePath?: string;
     accountStatePath?: string;
 } = {}) {
     const app = express();
     const accounts = new Accounts(options.accountStatePath || (options.statePath ? `${options.statePath}.accounts.json` : undefined));
+    const accountPath = options.accountStatePath || options.statePath;
+    const accountData = new AccountData(accountPath ? join(dirname(accountPath), 'account-data') : undefined);
+    const keys = new KeyDirectory(options.statePath ? `${options.statePath}.keys.json` : undefined, accountData);
+    registerAccountData(app, accounts, accountData, keys);
     const peers: SignalingContext["peers"] = new Map();
     const groups = new Map<string, Group>();
     const demoSecrets = new Map<string, string>();
@@ -51,14 +55,16 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
     });
     const publishGroup = (group: Group) => {
         const before = groups.get(group.id);
-        if (before && before.version > group.version)
+        if (before && before.version >= group.version)
             return;
         groups.set(group.id, group);
         for (const peerId of new Set([
             ...(before?.members || []),
             ...group.members,
-        ]))
-            peers.get(peerId)?.socket.emit("group:update", group);
+        ])) {
+            const target = peers.get(peerId)?.socket;
+            if (target && context.peerFor(target) === peerId) target.emit('group:update', group);
+        }
     };
     const currentGroup = async (id: string) => {
         const cached = groups.get(id);
@@ -67,11 +73,14 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
         const current = await directory.group(id);
         if (current)
             publishGroup(current);
-        return current;
+        return current ? groups.get(id) || null : null;
     };
     const publishPresence = () => {
-        io.to('registered-peers').emit('presence', [...peers.keys()]);
-        io.to('registered-peers').emit('peer:profiles', [...peers].map(([peerId, peer]) => ({ peerId, displayName: peer.displayName || peerId, online: true, lastSeen: peer.lastSeen })));
+        const profiles = context.onlineProfiles();
+        if (!profiles.length) return;
+        const recipients = profiles.map(peer => peers.get(peer.peerId)!.socket.id);
+        io.to(recipients).emit('presence', profiles.map(peer => peer.peerId));
+        io.to(recipients).emit('peer:profiles', profiles);
     };
     const context: SignalingContext = {
         accounts,
@@ -88,9 +97,13 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
         publishGroup,
         currentGroup,
         publishPresence,
-        peerFor: (socket) => socket.data.authSession && !accounts.authorize(socket.data.peerId, socket.data.authSession) ? undefined : socket.data.peerId as string | undefined,
+        onlineProfiles: () => onlineProfiles(context),
+        peerFor: (socket) => {
+            const peerId = socket.data.peerId as string | undefined, peer = peerId ? peers.get(peerId) : undefined;
+            return peerId && peer?.socket.id === socket.id && peerIsOnline(context, peerId, peer) ? peerId : undefined;
+        },
     };
-    app.get("/health", (_req, res) => res.json({ service: "signaling", peers: peers.size }));
+    app.get("/health", (_req, res) => res.json({ service: "signaling", peers: context.onlineProfiles().length }));
     app.get('/internal/sessions/authorize', (req, res) => {
         if (req.header('x-peer-secret') !== PEER_SECRET) return res.sendStatus(403);
         return res.json({ allowed: typeof req.query.peerId === 'string' && accounts.authorize(req.query.peerId, req.query.sessionId) });
@@ -109,7 +122,8 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
         }
     });
     io.on("connection", (socket) => {
-        guardSocket(socket, 'signal', ['auth:register', 'auth:login', 'auth:session', 'auth:logout', 'peer:register', 'peer:list', 'peer:lookup', 'signal:send', 'project:group', 'group:authorize', 'group:create', 'group:change']);
+        guardSocket(socket, 'signal', ['auth:register', 'auth:login', 'auth:session', 'auth:logout', 'peer:register', 'peer:list', 'peer:lookup', 'signal:send', 'key:publish', 'key:lookup', 'project:group', 'group:authorize', 'group:create', 'group:change']);
+        keys.register(socket, context);
         registerAuthHandlers(socket, accounts, context);
         registerPeerHandlers(socket, context);
         registerGroupHandlers(socket, context);
@@ -130,6 +144,6 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
     };
 }
 if (process.argv[1]?.endsWith("index.ts")) {
-    const server = createSignaling(undefined, undefined, undefined, { statePath: process.env.SIGNAL_STATE_PATH || fileURLToPath(new URL('../../.data/signaling.json', import.meta.url)), accountStatePath: process.env.ACCOUNT_STATE_PATH });
+    const server = createSignaling(undefined, undefined, undefined, { statePath: process.env.SIGNAL_STATE_PATH || join(dataRoot, 'signaling.json'), accountStatePath: process.env.ACCOUNT_STATE_PATH || (process.env.SIGNAL_STATE_PATH ? `${process.env.SIGNAL_STATE_PATH}.accounts.json` : join(dataRoot, 'accounts.json')) });
     server.httpServer.listen(Number(process.env.SIGNAL_PORT || 4001), "0.0.0.0", () => serviceLog('signal', 'LISTENING', String(process.env.SIGNAL_PORT || 4001)));
 }

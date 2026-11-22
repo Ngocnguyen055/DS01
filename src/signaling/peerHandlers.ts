@@ -1,30 +1,26 @@
 import { createHash } from "node:crypto";
 import jwt from "jsonwebtoken";
 import type { Socket } from "socket.io";
-import { peerDiscoverySchema, peerIdSchema } from "@ds01/shared";
+import { peerDiscoverySchema, peerIdSchema, peerRegistrationSchema } from "@ds01/shared";
 import { ACCOUNT_PEER_ID } from "./directChatAuthorization.ts";
 import type { SignalingContext, SignalingReply } from "./types.ts";
 import { serviceLog } from '../server-kit/runtime.ts';
 import { LOCAL_ACCOUNT_PREFIX } from './accounts.ts';
+import { peerIsOnline, removeExpiredPeer } from './presence.ts';
 function isRegistered(socket: Socket, context: SignalingContext) {
     const peerId = context.peerFor(socket);
     return !!peerId && context.peers.get(peerId)?.socket.id === socket.id;
 }
-/** Registration, heartbeat, discovery and disconnect handlers. */
+
 export function registerPeerHandlers(socket: Socket, context: SignalingContext) {
     socket.on("peer:register", async (input: unknown, reply: SignalingReply) => {
         if (typeof reply !== "function")
             return;
-        const { peerId: requestedId, identityProof } = (input || {}) as Record<string, unknown>;
-        let { displayName } = (input || {}) as Record<string, unknown>;
-        const parsed = peerIdSchema.safeParse(requestedId);
+        const parsed = peerRegistrationSchema.safeParse(input);
         if (!parsed.success)
-            return reply({ ok: false, error: "invalid peer ID" });
-        const peerId = parsed.data;
-        if (displayName !== undefined && (typeof displayName !== 'string' || !displayName.trim() || displayName.trim().length > 80))
-            return reply({ ok: false, error: 'invalid display name' });
-        if (typeof identityProof !== "string")
-            return reply({ ok: false, error: "identity proof required" });
+            return reply({ ok: false, error: "invalid registration data" });
+        const { peerId, identityProof, status, connection } = parsed.data;
+        let displayName = parsed.data.displayName || peerId;
         let authSession: string | undefined, authExpiresAt: number | undefined;
         if (peerId.startsWith(LOCAL_ACCOUNT_PREFIX)) {
             try {
@@ -38,8 +34,9 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
         else if (ACCOUNT_PEER_ID.test(peerId)) {
             try {
                 const token = jwt.verify(identityProof, context.jwtSecret, { algorithms: ['HS256'] }) as jwt.JwtPayload;
-                if (token.sub !== peerId)
+                if (token.sub !== peerId || typeof token.exp !== 'number')
                     throw new Error("wrong account");
+                authExpiresAt = token.exp * 1000;
             }
             catch {
                 return reply({ ok: false, error: "invalid account token" });
@@ -68,16 +65,16 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
                 return reply({ ok: false, error: 'identity persistence unavailable' });
             }
         }
-        if (context.peers.has(peerId) &&
-            context.peers.get(peerId)?.socket.id !== socket.id)
+        const existing = context.peers.get(peerId);
+        if (existing && existing.socket.id !== socket.id && !removeExpiredPeer(context, peerId, existing))
             return reply({ ok: false, error: "peer ID already online" });
-        const previous = context.peerFor(socket);
-        if (previous && previous !== peerId)
+        const previous = socket.data.peerId as string | undefined;
+        if (previous && previous !== peerId && context.peers.get(previous)?.socket.id === socket.id)
             context.peers.delete(previous);
         socket.data.peerId = peerId;
         socket.data.authSession = authSession;
         socket.data.authExpiresAt = authExpiresAt;
-        context.peers.set(peerId, { socket, lastSeen: Date.now(), displayName: typeof displayName === 'string' ? displayName.trim() : undefined });
+        context.peers.set(peerId, { socket, lastSeen: Date.now(), displayName, status, connection });
         void socket.join("registered-peers");
         if (ACCOUNT_PEER_ID.test(peerId)) {
             try {
@@ -88,14 +85,18 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
                 console.warn("[signal] project directory unavailable; project chat will fail closed");
             }
         }
-        const token = jwt.sign({ sub: peerId, ...(peerId.startsWith(LOCAL_ACCOUNT_PREFIX) ? { sid: socket.data.authSession } : {}) }, context.peerSecret, {
-            expiresIn: peerId.startsWith(LOCAL_ACCOUNT_PREFIX) ? Math.max(1, Math.floor((socket.data.authExpiresAt - Date.now()) / 1000)) : 12 * 60 * 60,
+        if (context.peerFor(socket) !== peerId)
+            return reply({ ok: false, error: 'registration no longer active' });
+        const token = jwt.sign({ sub: peerId, exp: Math.floor((authExpiresAt ?? Date.now() + 12 * 60 * 60 * 1000) / 1000), ...(peerId.startsWith(LOCAL_ACCOUNT_PREFIX) ? { sid: socket.data.authSession } : {}) }, context.peerSecret, {
+            algorithm: 'HS256', audience: 'ds01-relay', issuer: 'ds01-signaling',
         });
         serviceLog('signal', 'REGISTER', peerId);
+        const profiles = context.onlineProfiles();
         reply({
             ok: true,
             token,
-            peers: [...context.peers.keys()],
+            peers: profiles.map(peer => peer.peerId),
+            profiles,
             groups: [...context.groups.values()].filter((group) => group.members.includes(peerId)),
         });
         socket.emit("peer:ready");
@@ -111,7 +112,8 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
             return;
         if (!isRegistered(socket, context))
             return reply({ ok: false, error: "registration required" });
-        reply({ ok: true, peers: [...context.peers.keys()] });
+        const profiles = context.onlineProfiles();
+        reply({ ok: true, peers: profiles.map(peer => peer.peerId), profiles });
     });
     socket.on("peer:lookup", async (input: unknown, reply: SignalingReply) => {
         if (typeof reply !== "function")
@@ -141,10 +143,10 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
                 error: "direct chat authorization unavailable",
             });
         }
+        if (context.peerFor(socket) !== requesterId)
+            return reply({ ok: false, error: 'registration required' });
         const target = context.peers.get(peerId);
-        const peer = !target ||
-            !target.socket.connected ||
-            Date.now() - target.lastSeen > context.heartbeatFreshMs
+        const peer = !target || !peerIsOnline(context, peerId, target)
             ? {
                 peerId,
                 online: false as const,
@@ -155,16 +157,12 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
                 peerId,
                 online: true as const,
                 lastSeen: target.lastSeen,
-                connection: {
-                    transport: "webrtc-datachannel" as const,
-                    signaling: "socket.io" as const,
-                    relay: "socket.io" as const,
-                },
+                connection: target.connection,
             };
         reply({ ok: true, peer: peerDiscoverySchema.parse(peer) });
     });
     socket.on("disconnect", () => {
-        // A revoked session still owns its old socket entry and must be removed.
+
         const peerId = socket.data.peerId as string | undefined;
         if (peerId && context.peers.get(peerId)?.socket.id === socket.id) {
             context.peers.delete(peerId);

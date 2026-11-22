@@ -7,12 +7,12 @@ const usernameSchema = z.string().trim().toLowerCase().regex(/^[a-z0-9_-]{3,24}$
 const passwordSchema = z.string().min(10).max(128).refine(value => Buffer.byteLength(value) <= 256);
 const publicAccountSchema = z.object({ username: usernameSchema, peerId: z.string(), displayName: z.string().trim().min(1).max(80) });
 const userSchema = publicAccountSchema.extend({ salt: z.string().regex(/^[a-f0-9]{32}$/), passwordHash: z.string().regex(/^[a-f0-9]{128}$/), createdAt: z.number() });
-const stateSchema = z.object({ version: z.literal(1), users: z.array(userSchema), sessions: z.array(z.object({ id: z.string().regex(/^[a-f0-9]{64}$/), peerId: z.string(), expiresAt: z.number() })) });
+const stateSchema = z.object({ version: z.literal(1), users: z.array(userSchema), sessions: z.array(z.object({ id: z.string().regex(/^[a-f0-9]{64}$/), peerId: z.string(), expiresAt: z.number(), issuedAt: z.number().optional() })) });
 export type Account = z.infer<typeof publicAccountSchema>;
 type AccountState = z.infer<typeof stateSchema>;
 const sessionId = (token: string) => createHash('sha256').update(token).digest('hex');
 
-/** Separate local account registry; chat contents never pass through this component. */
+
 export class Accounts {
     private disk: AtomicState<AccountState>;
     private state: AccountState;
@@ -56,7 +56,7 @@ export class Accounts {
         this.throttle(ip, username);
         if (this.state.users.some(user => user.username === username)) throw Error('Tên đăng nhập đã được sử dụng.');
         const salt = randomBytes(16).toString('hex'), hash = await this.derive(password, salt);
-        // Recheck after asynchronous hashing: simultaneous registrations must not overwrite ownership.
+
         if (this.state.users.some(user => user.username === username)) throw Error('Tên đăng nhập đã được sử dụng.');
         const user = { username, peerId: LOCAL_ACCOUNT_PREFIX + username, displayName, salt, passwordHash: hash.toString('hex'), createdAt: Date.now() };
         this.commit({ ...this.state, users: [...this.state.users, user] });
@@ -64,7 +64,7 @@ export class Accounts {
         return this.public(user);
     }
     async login(input: unknown, ip: string, isOnline: (id: string) => boolean) {
-        const parsed = z.object({ username: usernameSchema, password: passwordSchema }).strict().safeParse(input);
+        const parsed = z.object({ username: usernameSchema, password: passwordSchema, takeover: z.boolean().optional() }).strict().safeParse(input);
         if (!parsed.success) throw Error('Tên đăng nhập hoặc mật khẩu không đúng.');
         const { username, password } = parsed.data;
         this.throttle(ip, username);
@@ -74,9 +74,9 @@ export class Accounts {
             serviceLog('auth', 'LOGIN_DENIED');
             throw Error('Tên đăng nhập hoặc mật khẩu không đúng.');
         }
-        if (isOnline(user.peerId)) throw Error('Tài khoản đang online ở phiên khác. Hãy đăng xuất phiên đó trước.');
+        if (isOnline(user.peerId) && !parsed.data.takeover) throw Error('Tài khoản đang online ở thiết bị khác. Chọn chuyển phiên đăng nhập để dùng thiết bị này.');
         const token = randomBytes(32).toString('hex'), expiresAt = Date.now() + 12 * 60 * 60_000;
-        this.commit({ ...this.state, sessions: [...this.state.sessions.filter(session => session.peerId !== user.peerId && session.expiresAt > Date.now()), { id: sessionId(token), peerId: user.peerId, expiresAt }] });
+        this.commit({ ...this.state, sessions: [...this.state.sessions.filter(session => session.peerId !== user.peerId && session.expiresAt > Date.now()), { id: sessionId(token), peerId: user.peerId, expiresAt, issuedAt: Date.now() }] });
         serviceLog('auth', 'LOGIN', user.peerId);
         return { account: this.public(user), token, expiresAt };
     }
@@ -88,7 +88,7 @@ export class Accounts {
         const id = sessionId(token), session = this.state.sessions.find(session => session.id === id && session.expiresAt > Date.now());
         const user = session && this.state.users.find(user => user.peerId === session.peerId);
         if (!session || !user) throw Error('Phiên đăng nhập không hợp lệ hoặc đã hết hạn.');
-        return { account: this.public(user), sessionId: id, expiresAt: session.expiresAt };
+        return { account: this.public(user), sessionId: id, expiresAt: session.expiresAt, issuedAt: session.issuedAt || 0 };
     }
     logout(token: unknown) {
         const session = this.resolve(token);
