@@ -65,7 +65,7 @@ describe('recovery and adversarial inputs', () => {
         const store=new MemoryStore();let attempts=0;let delivery!:MessageDelivery;
         delivery=new MessageDelivery({peerId:'peer-a',store,ackTimeoutMs:10,getGroup:()=>undefined,syncProjectGroup:async()=>{throw Error('unused');},authorizeGroup:async()=>{throw Error('unused');},selectMode:async()=>'RELAY',emit:()=>{},log:()=>{},transport:async packet=>{
             attempts++;await new Promise(resolve=>setTimeout(resolve,40));
-            await delivery.receive({...packet,type:'ack',body:'',messageId:randomUUID(),senderId:'peer-b',receiverId:'peer-a',ackFor:packet.messageId},'RELAY');
+            await delivery.receive({...packet,type:'ack',body:'',messageId:randomUUID(),senderId:'peer-b',receiverId:'peer-a',ackFor:packet.messageId,ackRequested:false},'RELAY');
         }});
         await delivery.sendDirect('peer-b','slow transport, valid ACK');expect(attempts).toBe(1);expect(store.rows[0].status).toBe('delivered');delivery.close();
     });
@@ -77,9 +77,20 @@ describe('recovery and adversarial inputs', () => {
         let url = await start(server);
         const a = await register(url, 'peer-a');
         expect(a.response.ok).toBe(true);
-        const created = await a.socket.timeout(2000).emitWithAck('group:create', { members: ['peer-b'], name: 'Nhóm bền vững' });
+        const b = await register(url, 'peer-b');
+        const c = await register(url, 'peer-c');
+        const created = await a.socket.timeout(2000).emitWithAck('group:create', { members: ['peer-b', 'peer-c'], name: 'Nhóm bền vững' });
         expect(created.ok).toBe(true);
+        const [first, second] = await Promise.all([
+            a.socket.timeout(2000).emitWithAck('group:change', { groupId: created.group.id, memberId: 'peer-c', action: 'remove', version: 1 }),
+            b.socket.timeout(2000).emitWithAck('group:change', { groupId: created.group.id, memberId: 'peer-b', action: 'remove', version: 1 }),
+        ]);
+        expect([first.ok, second.ok].filter(Boolean)).toHaveLength(1);
+        const expected = { ...created.group, version: 2, members: first.ok ? ['peer-a', 'peer-b'] : ['peer-a', 'peer-c'] };
+        expect(server.groups.get(created.group.id)).toEqual(expected);
         a.socket.disconnect();
+        b.socket.disconnect();
+        c.socket.disconnect();
         await server.close();
         services.splice(services.indexOf(server), 1);
         server = createSignaling(undefined, undefined, undefined, { statePath: path });
@@ -87,7 +98,8 @@ describe('recovery and adversarial inputs', () => {
         const attacker = await register(url, 'peer-a', 'another-identity-proof-12345');
         expect(attacker.response.ok).toBe(false);
         const owner = await register(url, 'peer-a');
-        expect(owner.response.groups).toEqual([created.group]);
+        expect(owner.response.groups).toEqual([expected]);
+        expect(server.groups.get(created.group.id)).toEqual(expected);
         writeFileSync(join(folder, 'corrupt.json'), '{damaged');
         expect(() => createSignaling(undefined, undefined, undefined, { statePath: join(folder, 'corrupt.json') })).toThrow();
     });
@@ -147,7 +159,7 @@ describe('recovery and adversarial inputs', () => {
         expect(store.rows[0].status).toBe('failed');
         store.rows[0].status = 'sent';
         let resumed!: MessageDelivery;
-        resumed = new MessageDelivery({ ...config, transport: async (packet) => { await resumed.receive({ ...packet, type: 'ack', body: '', messageId: randomUUID(), senderId: 'peer-b', receiverId: 'peer-a', ackFor: packet.messageId }, 'RELAY'); } });
+        resumed = new MessageDelivery({ ...config, transport: async (packet) => { await resumed.receive({ ...packet, type: 'ack', body: '', messageId: randomUUID(), senderId: 'peer-b', receiverId: 'peer-a', ackFor: packet.messageId, ackRequested: false }, 'RELAY'); } });
         await resumed.sendDirect('peer-b', 'after restart');
         expect(store.rows.map(row => row.status)).toEqual(['failed', 'delivered']);
         expect(store.rows[1].message.sequence).toBe(2);
