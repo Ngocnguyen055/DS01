@@ -1,10 +1,12 @@
 import { z } from 'zod';
 import { AtomicState } from '../server-kit/runtime.ts';
 import { canonical, parseWireMessage, type WireMessage } from '../shared/secure.ts';
+import { superPeerSchema } from '../shared/overlayProtocol.ts';
 
-export const journalEntrySchema = z.object({ key: z.string().min(1).max(200), kind: z.literal('mail'), clock: z.number().int().nonnegative().safe(), origin: z.string().min(1).max(100),
+export const journalEntrySchema = z.object({ key: z.string().min(1).max(200), kind: z.enum(['mail', 'candidate']), clock: z.number().int().nonnegative().safe(), origin: z.string().min(1).max(100),
     expiresAt: z.number().int().positive().safe(), deleted: z.boolean(), value: z.unknown().optional() }).strict();
 export type JournalEntry = z.infer<typeof journalEntrySchema>;
+export type Candidate = { peerId: string; url: string; leaseUntil: number };
 const snapshotSchema = z.object({ clock: z.number().int().nonnegative().safe(), entries: z.array(journalEntrySchema).max(20000) }).strict();
 export class RelayJournal {
     readonly entries = new Map<string, JournalEntry>();
@@ -22,6 +24,9 @@ export class RelayJournal {
             if (entry.kind === 'mail') {
                 const packet = parseWireMessage(entry.value);
                 if (entry.key !== this.mailKey(packet.senderId, packet.messageId, packet.receiverId)) throw Error('replica mail key mismatch');
+            } else {
+                const value = superPeerSchema.parse(entry.value);
+                if (entry.key !== `candidate:${value.peerId}` || value.leaseUntil !== entry.expiresAt) throw Error('invalid relay candidate');
             }
         }
         return entry;
@@ -71,6 +76,11 @@ export class RelayJournal {
     }
     pending(peerId?: string) {
         return [...this.entries.values()].filter(entry => entry.kind === 'mail' && !entry.deleted && entry.expiresAt > Date.now() && (!peerId || parseWireMessage(entry.value).receiverId === peerId));
+    }
+    offer(candidate: Candidate) { return this.write('candidate', `candidate:${candidate.peerId}`, candidate, candidate.leaseUntil); }
+    leader() {
+        return [...this.entries.values()].filter(entry => entry.kind === 'candidate' && !entry.deleted && entry.expiresAt > Date.now())
+            .map(entry => entry.value as Candidate).sort((a, b) => a.peerId > b.peerId ? -1 : a.peerId < b.peerId ? 1 : 0)[0];
     }
     prune() {
         let changed = false;

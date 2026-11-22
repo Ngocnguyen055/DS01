@@ -44,6 +44,16 @@ function browserStorage() {
 afterEach(() => { deliveries.splice(0).forEach(value => value.close()); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('reliable delivery and message identity', () => {
+    it('retains the cause and recipient when missing keys exhaust the bounded send attempts', async () => {
+        const store = new MemoryStore(), logs: string[] = [];
+        const sender = delivery('peer-a', store, { transport: async () => { throw Error('peer has no published security key'); }, log: text => logs.push(text) });
+        await expect(sender.sendDirect('peer-b', 'private content')).rejects.toThrow('delivery failed to peer-b: Error: peer has no published security key');
+        const failed = logs.filter(text => text.startsWith('send attempt'));
+        expect(failed).toHaveLength(MAX_DELIVERY_ATTEMPTS);
+        expect(failed.every(text => text.includes('peer=peer-b') && text.includes('message=') && text.includes('type=text'))).toBe(true);
+        expect(logs.join('\n')).not.toContain('private content');
+        expect(store.rows[0].status).toBe('failed');
+    });
     it('processes outgoing ACKs while an unrelated incoming message is blocked on storage', async () => {
         const store = new MemoryStore();
         let entered!: () => void, release!: () => void;

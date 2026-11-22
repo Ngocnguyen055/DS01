@@ -118,6 +118,43 @@ function sessionFixture(extra: Partial<ConstructorParameters<typeof MediaSession
 }
 
 describe('call lifecycle and recovery', () => {
+    it.each(['audio', 'video'] as const)('simulates blocked ICE for a new %s call and delivers real relay frames only after consent', async kind => {
+        const { callId, ac, bc } = await ciphers(), configurations: RTCConfiguration[] = [], logs: string[] = [];
+        const link = { send: vi.fn(() => true), close: vi.fn() };
+        let simulate = true;
+        const { session, driver, states } = sessionFixture({
+            rtc: class extends FakeRTC { constructor(config: RTCConfiguration) { super(); configurations.push(config); } } as unknown as RTCFactory,
+            simulateIceFailure: () => simulate, iceServers: [{ urls: 'turn:example.org', username: 'demo', credential: 'temporary' }],
+            fallbackMs: 10, relay: async () => link, cipher: async () => bc, log: text => logs.push(text),
+        });
+        await session.receive('peer-a', { action: 'offer', callId, kind, sdp: 'offer-sdp', relay: 1 });
+        expect(configurations).toHaveLength(0);
+        expect(driver.prepare).not.toHaveBeenCalled();
+        await session.accept();
+        expect(configurations).toEqual([{ iceServers: [], iceTransportPolicy: 'relay' }]);
+        expect(states.at(-1)?.route).toBeUndefined();
+        await vi.waitFor(() => expect(driver.prepare).toHaveBeenCalledOnce());
+        await session.receive('peer-a', { action: 'relay-ready', callId });
+        await session.receiveFrame(await ac.seal('audio', 0, new Uint8Array(1280).fill(37)));
+        expect(driver.receive).toHaveBeenCalledWith('audio', new Uint8Array(1280).fill(37), 0);
+        expect(states.at(-1)).toMatchObject({ route: 'RELAY', phase: 'connected' });
+        expect(logs).toContain('CALL_ICE_BLOCKED ' + callId + ' simulation=1');
+        await session.end();
+        simulate = false;
+        await session.start('peer-a', kind);
+        expect(configurations.at(-1)).toEqual({ iceServers: [{ urls: 'turn:example.org', username: 'demo', credential: 'temporary' }], iceTransportPolicy: 'all' });
+    });
+    it('reports the concrete relay failure instead of silently relabeling a failed call', async () => {
+        const logs: string[] = [], { bc, callId } = await ciphers();
+        const { session, states } = sessionFixture({ fallbackMs: 10, cipher: async () => bc,
+            relay: async () => { throw Error('destination relay connection offline'); }, log: text => logs.push(text) });
+        await session.receive('peer-a', { action: 'offer', callId, kind: 'audio', sdp: 'offer-sdp', relay: 1 });
+        await session.accept();
+        await vi.waitFor(() => expect(states.at(-1)?.phase).toBe('failed'));
+        expect(states.at(-1)?.route).toBeUndefined();
+        expect(states.at(-1)?.error).toBe('destination relay connection offline');
+        expect(logs).toContain('CALL_RELAY_ERROR ' + callId + ' peer=peer-a destination relay connection offline');
+    });
     it('serializes media signaling while an answer is being applied', async () => {
         const { session, pc } = sessionFixture();
         await session.start('peer-b', 'audio');

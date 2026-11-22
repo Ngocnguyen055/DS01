@@ -72,7 +72,7 @@ try {
             await writeFile(join(directory, 'ui-login-mobile.png'), Buffer.from(preview.data, 'base64'));
             await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 960, deviceScaleFactor: 1, mobile: false }, sessionId);
         }
-        await evaluate(sessionId, `(async()=>{const {PeerClient}=await import('/@fs/'+${JSON.stringify(root.replaceAll('\\', '/') + '/src/shared/peer.ts')});const {WebStore}=await import('/store.ts');window.Peer=PeerClient;window.Store=WebStore;window.rtc=[];window.wire=[];window.events=[];const Native=RTCPeerConnection;window.RTC=class extends Native{constructor(...a){super(...a);window.rtc.push(this);this.addEventListener('icecandidateerror',e=>window.events.push({kind:'log',text:e.errorCode+':'+e.errorText}))}};const send=RTCDataChannel.prototype.send;RTCDataChannel.prototype.send=function(d){window.wire.push(JSON.parse(d));return send.call(this,d)};window.config={peerId:${JSON.stringify(id)},identityProof:'advanced-browser-'+${JSON.stringify(id)},displayName:${JSON.stringify(id)},signalUrl:${JSON.stringify(signalUrl)},relayUrl:${JSON.stringify(relayUrls[0])},relayUrls:[${JSON.stringify(relayUrls[1])}],rtc:RTC,store:new WebStore(${JSON.stringify(id)}),identityStore:new WebStore(${JSON.stringify(id)}),encryption:true,iceServers:[{urls:${JSON.stringify(`turn:127.0.0.1:${tp}?transport=udp`)},username:${JSON.stringify(username)},credential:${JSON.stringify(credential)}}],rtcPolicy:'relay',directTimeoutMs:8000,ackTimeoutMs:2000,onEvent:e=>{window.events.push(e);if(e.kind==='call')window.lastCall=e.call;}};window.peer=new PeerClient(config);await peer.connect();return true})()`);
+        await evaluate(sessionId, `(async()=>{const {PeerClient}=await import('/@fs/'+${JSON.stringify(root.replaceAll('\\', '/') + '/src/shared/peer.ts')});const {WebStore}=await import('/store.ts');window.Peer=PeerClient;window.Store=WebStore;window.rtc=[];window.wire=[];window.events=[];const Native=RTCPeerConnection;window.RTC=class extends Native{constructor(...a){super(...a);window.rtc.push(this);this.addEventListener('icecandidateerror',e=>window.events.push({kind:'log',text:e.errorCode+':'+e.errorText}))}};const send=RTCDataChannel.prototype.send;RTCDataChannel.prototype.send=function(d){window.wire.push(JSON.parse(d));return send.call(this,d)};window.config={peerId:${JSON.stringify(id)},identityProof:'advanced-browser-'+${JSON.stringify(id)},displayName:${JSON.stringify(id)},signalUrl:${JSON.stringify(signalUrl)},relayUrl:${JSON.stringify(relayUrls[0])},relayUrls:[${JSON.stringify(relayUrls[1])}],rtc:RTC,store:new WebStore(${JSON.stringify(id)}),identityStore:new WebStore(${JSON.stringify(id)}),encryption:true,relaySelection:'latency-load',iceServers:[{urls:${JSON.stringify(`turn:127.0.0.1:${tp}?transport=udp`)},username:${JSON.stringify(username)},credential:${JSON.stringify(credential)}}],rtcPolicy:'relay',directTimeoutMs:8000,ackTimeoutMs:2000,onEvent:e=>{window.events.push(e);if(e.kind==='call')window.lastCall=e.call;}};window.peer=new PeerClient(config);await peer.connect();return true})()`);
     }
     const [a, b, c] = pages, rows = (s, id) => evaluate(s, `new Store(${JSON.stringify(id)}).list()`);
     const forwards = async () => (await Promise.all(relayUrls.map(async x => (await (await fetch(x + '/health')).json()).metrics.forwardedMessages))).reduce((x, y) => x + y, 0);
@@ -104,7 +104,7 @@ try {
     for (const page of [a, b]) await evaluate(page, `nativeOutput.pause();nativeOutput.srcObject=null;nativeAudio.close()`);
     check('hangup releases camera and microphone tracks', await evaluate(a, `lastCall.local.getTracks().every(t=>t.readyState==='ended')`));
     for (const page of [a, b]) {
-        await evaluate(page, `(async()=>{peer.close();window.peer=new Peer({...config,rtc:class extends RTCPeerConnection{},iceServers:[],rtcPolicy:'relay'});window.relayWire=[];for(const s of peer.relays.values())s.on('media:frame',x=>relayWire.push(x));await peer.connect();for(const s of peer.relays.values())s.on('media:frame',x=>relayWire.push(x));})()`);
+        await evaluate(page, `(async()=>{peer.close();window.peer=new Peer({...config,simulateMediaIceFailure:true});window.relayWire=[];for(const s of peer.relays.values())s.on('media:frame',x=>relayWire.push(x));await peer.connect();for(const s of peer.relays.values())s.on('media:frame',x=>relayWire.push(x));})()`);
     }
     const mediaBefore = (await (await fetch(relayUrls[0] + '/health')).json()).metrics.mediaFrames;
     await evaluate(a, `peer.media.start('peer-b','video')`);
@@ -150,8 +150,81 @@ try {
     await call('Page.reload', {}, a); await until(() => evaluate(a, 'document.readyState === "complete"'), 'reload');
     const restored = await evaluate(a, `(async()=>{const {WebStore}=await import('/store.ts');return (await new WebStore('peer-a').getIdentity()).public})()`);
     check('nonextractable device identity persists across browser reload', JSON.stringify(restored) === JSON.stringify(identity));
+    signaling.kill();
+    const dhtIds = [];
+    for (const page of [b, c]) {
+        dhtIds.push(await evaluate(page, `(async()=>{peer.close();const secure=await import('/@fs/'+${JSON.stringify(root.replaceAll('\\', '/') + '/src/shared/secure.ts')});const overlay=await import('/@fs/'+${JSON.stringify(root.replaceAll('\\', '/') + '/src/shared/overlayProtocol.ts')});const store=new Store('dht-device');let identity=await store.getIdentity();if(!identity){identity=await secure.createIdentity();await store.putIdentity(identity)}window.dhtId=await overlay.decentralizedPeerId(identity);window.dhtConfig={...config,peerId:dhtId,signalUrl:'http://127.0.0.1:1',relayUrl:${JSON.stringify(relayUrls[1])},relayUrls:[],store,identityStore:store,discovery:'dht',forceRelay:false};window.peer=new Peer(dhtConfig);await peer.connect();return dhtId})()`));
     }
-    report.passed = report.checks.every(check => check.passed);
+    await evaluate(b, `peer.send(${JSON.stringify(dhtIds[1])},'DHT real TURN secret')`);
+    await until(() => evaluate(c, `(async()=>{return (await new Store('dht-device').list()).some(x=>x.message.body==='DHT real TURN secret'&&x.status==='received')})()`), 'DHT encrypted delivery');
+    check('DHT uses real WebRTC TURN with signaling process stopped', await evaluate(b, `(async()=>{return (await new Store('dht-device').list()).some(x=>x.message.body==='DHT real TURN secret'&&x.message.mode==='TURN'&&x.status==='delivered')})()`));
+    await evaluate(c, 'peer.close()'); await call('Page.reload', {}, c);
+    await until(() => evaluate(c, '!!document.querySelector(".demo-toggle")'), 'DHT UI login');
+    await evaluate(c, 'document.querySelector(".demo-toggle").click()');
+    await pause(100);
+    await evaluate(c, `(()=>{const e=document.querySelector('input[autocomplete=nickname]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,'DHT Browser UI');e.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await pause(100);
+    await evaluate(c, `[...document.querySelectorAll('button')].find(x=>x.textContent.includes('DHT')).click()`);
+    await until(() => evaluate(c, `document.querySelector('.self-profile small')?.textContent.startsWith('p_') && !!document.querySelector('.connection-pill.is-online')`), 'DHT UI connected without signaling');
+    report.uiDhtPeerId = await evaluate(c, `document.querySelector('.self-profile small').textContent`);
+    check('DHT entry in the actual application derives Peer ID and joins without a signaling server', true);
+    await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 960, deviceScaleFactor: 1, mobile: false }, c);
+    await evaluate(c, `document.querySelector('.diagnostics-link').click()`); await pause(100);
+    check('application diagnostics show E2EE and decentralized discovery', await evaluate(c, `document.querySelector('.advanced-panel').textContent.includes('E2EE') && document.querySelector('.advanced-panel').textContent.includes('DHT')`));
+    const screenshot = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, c); await writeFile(join(directory, 'advanced-ui.png'), Buffer.from(screenshot.data, 'base64'));
+    await call('Page.reload', {}, c);
+    await until(() => evaluate(c, `document.querySelector('.self-profile small')?.textContent===${JSON.stringify(report.uiDhtPeerId)} && !!document.querySelector('.connection-pill.is-online')`), 'DHT UI reload');
+    check('DHT UI reload restores the same device identity', true);
+    await until(() => evaluate(b, `(async()=>{return (await peer.lookupPeer(${JSON.stringify(report.uiDhtPeerId)})).online})()`), 'DHT application reachable');
+    await evaluate(b, `peer.media.start(${JSON.stringify(report.uiDhtPeerId)},'video')`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='incoming'`), 'video call in actual application');
+    await call('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true }, c);
+    check('incoming call controls stay visible on the mobile conversation list', await evaluate(c, `(()=>{const p=document.querySelector('.call-panel'),r=p.getBoundingClientRect();return p.getClientRects().length>0&&r.left>=0&&r.right<=innerWidth&&!!p.querySelector('.primary-button')})()`));
+    let frame = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, c); await writeFile(join(directory, 'ui-call-incoming-mobile.png'), Buffer.from(frame.data, 'base64'));
+    await evaluate(c, `document.querySelector('.call-panel .primary-button').click()`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='connected' && document.querySelector('.call-panel .remote-video').videoWidth>0`), 'application video playback');
+    check('application accepts a real TURN video call and renders the remote stream', await evaluate(c, `document.querySelector('.call-panel [role=status]').textContent.includes('TURN') && !!document.querySelector('.call-panel .local-video').srcObject`));
+    frame = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, c); await writeFile(join(directory, 'ui-call-connected-mobile.png'), Buffer.from(frame.data, 'base64'));
+    await evaluate(c, `[...document.querySelectorAll('.call-actions button')].find(x=>x.textContent.includes('Tắt mic')).click()`);
+    check('application mute control updates its state and disables the microphone track', await evaluate(c, `!!document.querySelector('.call-actions button[aria-pressed=true]') && document.querySelector('.call-panel .local-video').srcObject.getAudioTracks().every(t=>!t.enabled)`));
+    await evaluate(c, `document.querySelector('.call-panel .danger').click()`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='ended'`), 'application hangup');
+    await until(() => evaluate(b, `lastCall?.phase==='ended'`), 'remote application hangup');
+    await evaluate(c, `document.querySelector('.call-panel .secondary-button').click()`);
+    check('application hangup reaches the remote peer and dismisses the call panel', await evaluate(c, `!document.querySelector('.call-panel')`));
+    await evaluate(b, `(async()=>{peer.close();window.peer=new Peer(dhtConfig);await peer.connect()})()`);
+    await evaluate(c, `document.querySelector('.diagnostics-link').click()`);
+    await until(() => evaluate(c, `!!document.querySelector('input[aria-label="Kiểm tra cuộc gọi qua relay"]')`), 'relay call simulation control');
+    await evaluate(c, `document.querySelector('input[aria-label="Kiểm tra cuộc gọi qua relay"]').click()`);
+    check('application enables blocked call ICE without rebuilding or changing chat connectivity', await evaluate(c, `document.querySelector('input[aria-label="Kiểm tra cuộc gọi qua relay"]').checked && document.querySelector('.connection-pill.is-online')!==null`));
+    await evaluate(c, `document.querySelector('button[aria-label="Đóng chẩn đoán"]').click()`);
+    await evaluate(c, `window.playMedia=HTMLMediaElement.prototype.play;HTMLMediaElement.prototype.play=function(){return this.tagName==='AUDIO'?Promise.reject(new DOMException('Playback requires a tap','NotAllowedError')):playMedia.call(this)}`);
+    await evaluate(b, `peer.media.start(${JSON.stringify(report.uiDhtPeerId)},'video')`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='incoming'`), 'blocked ICE video call in application');
+    await evaluate(c, `document.querySelector('.call-actions .primary-button').click()`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='connected'&&document.querySelector('.relay-video')?.naturalWidth>0`), 'application relay video renders');
+    check('mobile application renders remote relay video when WebRTC is blocked', await evaluate(c, `document.querySelector('.call-panel [role=status]').textContent.includes('RELAY')&&document.querySelector('.call-panel audio').srcObject.getAudioTracks().length===1`));
+    check('blocked autoplay offers an explicit audio playback control', await evaluate(c, `[...document.querySelectorAll('.call-panel button')].some(x=>x.textContent==='Bật âm thanh cuộc gọi')`));
+    await evaluate(c, `HTMLMediaElement.prototype.play=playMedia;[...document.querySelectorAll('.call-panel button')].find(x=>x.textContent==='Bật âm thanh cuộc gọi').click()`);
+    await until(() => evaluate(c, `!document.querySelector('.call-panel audio').paused&&!([...document.querySelectorAll('.call-panel button')].some(x=>x.textContent==='Bật âm thanh cuộc gọi'))`), 'audio playback resumes after user action');
+    check('audio playback resumes after the user taps the audio control', true);
+    frame = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, c); await writeFile(join(directory, 'ui-call-relay-mobile.png'), Buffer.from(frame.data, 'base64'));
+    await evaluate(c, `document.querySelector('.call-panel .danger').click()`); await until(() => evaluate(b, `lastCall?.phase==='ended'`), 'application relay hangup');
+    await evaluate(b, `peer.media.start(${JSON.stringify(report.uiDhtPeerId)},'audio')`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='incoming'`), 'simulated blocked audio in application');
+    await evaluate(c, `document.querySelector('.call-actions .primary-button').click()`);
+    await until(() => evaluate(c, `document.querySelector('.call-panel')?.dataset.phase==='connected'&&document.querySelector('.call-panel [role=status]').textContent.includes('RELAY')`), 'application audio switches to relay');
+    await until(() => evaluate(b, `lastCall?.phase==='connected'&&lastCall.route==='RELAY'&&lastCall.kind==='audio'`), 'reverse relay audio confirmed');
+    check('the same application checkbox makes audio calls fall back with both peers confirmed on RELAY', true);
+    await evaluate(c, `document.querySelector('.call-panel .danger').click()`); await until(() => evaluate(b, `lastCall?.phase==='ended'`), 'simulated audio hangup');
+    await evaluate(c, `document.querySelector('.diagnostics-link').click()`);
+    await evaluate(c, `document.querySelector('input[aria-label="Kiểm tra cuộc gọi qua relay"]').click()`);
+    check('application disables call simulation and records the injected fault in peer logs', await evaluate(c, `!document.querySelector('input[aria-label="Kiểm tra cuộc gọi qua relay"]').checked&&document.querySelector('.log-console').textContent.includes('CALL_ICE_BLOCKED')`));
+    await evaluate(c, `document.querySelector('button[aria-label="Đóng chẩn đoán"]').click()`);
+    report.privateCallHistory = await evaluate(c, `JSON.parse(localStorage.getItem('ds01-history-v1-'+${JSON.stringify(report.uiDhtPeerId)}+'-calls')||'[]')`);
+    check('private call history persists direction, route and end time for both native and relay calls', report.privateCallHistory.length>=2&&report.privateCallHistory.some(record=>record.route==='TURN'&&record.endedAt)&&report.privateCallHistory.some(record=>record.route==='RELAY'&&record.endedAt)&&report.privateCallHistory.every(record=>record.direction==='incoming'));
+    report.passed = true;
+    }
 } catch (error) { report.passed = false; report.error = String(error); console.error(error); process.exitCode = 1; }
 finally {
     report.finishedAt = new Date().toISOString();

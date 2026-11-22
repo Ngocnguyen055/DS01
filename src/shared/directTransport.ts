@@ -1,7 +1,8 @@
 import type { DeliveryMode } from "./protocol.ts";
 import type { RTCFactory } from "./peerTypes.ts";
-import { inspectIceRoute } from './iceRoute.ts';
-export type SignalKind = "request" | "offer" | "answer" | "ice" | "media";
+import { inspectIceRoute, DEFAULT_ICE_SERVERS } from './iceRoute.ts';
+import { randomUUID } from './uuid.ts';
+export type SignalKind = "request" | "offer" | "answer" | "ice" | 'media';
 export type SignalPacket = {
     from: string;
     kind: SignalKind;
@@ -18,6 +19,7 @@ type DirectConnection = {
     negotiating?: Promise<void>;
     route: 'DIRECT' | 'TURN';
     classification?: Promise<void>;
+    requestId: string;
 };
 type DirectTransportConfig = {
     peerId: string;
@@ -34,8 +36,27 @@ type DirectTransportConfig = {
 export class DirectTransport {
     private connections = new Map<string, DirectConnection>();
     private signals = new Map<string, Promise<void>>();
+    private requests = new Map<string, string>();
     private closed = false;
     constructor(private config: DirectTransportConfig) { }
+    private async diagnose(peerId: string, direct: DirectConnection) {
+        const summary: Record<string, unknown> = { pc: direct.pc.connectionState, ice: direct.pc.iceConnectionState,
+            gathering: direct.pc.iceGatheringState, signaling: direct.pc.signalingState, channel: direct.channel?.readyState || 'absent' };
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const stats = await Promise.race([direct.pc.getStats(), new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 200); })]);
+            const local: Record<string, number> = {}, remote: Record<string, number> = {}, pairs: Record<string, number> = {};
+            stats?.forEach(row => {
+                const bucket = row.type === 'local-candidate' ? local : row.type === 'remote-candidate' ? remote : row.type === 'candidate-pair' ? pairs : undefined;
+                if (!bucket) return;
+                const label = row.type === 'candidate-pair' ? row.state : row.candidateType;
+                if (['host', 'srflx', 'prflx', 'relay', 'frozen', 'waiting', 'in-progress', 'failed', 'succeeded'].includes(label)) bucket[label] = (bucket[label] || 0) + 1;
+            });
+            Object.assign(summary, { local, remote, pairs, stats: !!stats });
+        } catch { summary.stats = false; }
+        finally { clearTimeout(timer); }
+        if (this.current(peerId, direct)) this.config.log(`DIRECT_DIAGNOSTIC peer=${peerId} ${JSON.stringify(summary)}`);
+    }
     private current(peerId: string, direct: DirectConnection) {
         return !this.closed && this.connections.get(peerId) === direct && direct.pc.connectionState !== 'closed';
     }
@@ -62,13 +83,16 @@ export class DirectTransport {
             return item;
         const pc = new this.config.rtc({
             iceTransportPolicy: this.config.policy || 'all',
-            iceServers: this.config.iceServers || [
-                { urls: "stun:stun.l.google.com:19302" },
-            ],
+            iceServers: this.config.iceServers || DEFAULT_ICE_SERVERS,
         });
-        item = { pc, ready: false, candidates: [], failedUntil: 0, route: 'DIRECT' };
+        item = { pc, ready: false, candidates: [], failedUntil: 0, route: 'DIRECT', requestId: randomUUID() };
         this.connections.set(peerId, item);
+        const counts: Record<string, number> = {};
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete' && this.current(peerId, item!)) this.config.log(`DIRECT_CANDIDATES peer=${peerId} ${JSON.stringify(counts)}`);
+        };
         pc.onicecandidate = (event) => {
+            if (event.candidate) { const type = event.candidate.type || 'unknown'; counts[type] = (counts[type] || 0) + 1; }
             if (event.candidate && this.current(peerId, item!))
                 void this.config
                     .sendSignal(peerId, "ice", event.candidate.toJSON())
@@ -80,6 +104,9 @@ export class DirectTransport {
             if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
                 this.fail(peerId, item!, `direct lost ${peerId}: ${pc.connectionState}; RELAY fallback`);
             }
+        };
+        pc.onicecandidateerror = event => {
+            if (this.current(peerId, item!)) this.config.log(`DIRECT ICE error peer=${peerId} code=${event.errorCode}`);
         };
         pc.ondatachannel = (event) => {
             if (this.current(peerId, item!)) this.attachChannel(peerId, item!, event.channel);
@@ -96,6 +123,7 @@ export class DirectTransport {
                     if (!route)
                         throw new Error('selected ICE route is unavailable');
                     direct.route = route.mode;
+                    this.config.log(`ICE_SELECTED peer=${peerId} mode=${route.mode} local=${route.localType} remote=${route.remoteType}`);
                 }
                 catch (error) {
                     if (!this.current(peerId, direct)) return;
@@ -161,6 +189,10 @@ export class DirectTransport {
     }
     private async handleSignal(packet: SignalPacket): Promise<void> {
         const { from, kind, data } = packet;
+        if (kind === 'request' && data && typeof data === 'object' && 'requestId' in data && typeof data.requestId === 'string') {
+            if (this.requests.get(from) === data.requestId && this.connections.get(from)?.ready) return;
+            this.requests.set(from, data.requestId);
+        }
         const direct = this.connection(from, kind === 'offer' || kind === 'request');
         if (kind === "request") {
             if (this.config.peerId < from && direct.pc.signalingState === "stable")
@@ -205,6 +237,8 @@ export class DirectTransport {
         if (direct.opening)
             return direct.opening;
         direct.opening = (async () => {
+            const hasTurn = this.config.iceServers?.some(server => [server.urls].flat().some(url => /^turns?:/i.test(url))) || false;
+            this.config.log(`DIRECT_ATTEMPT peer=${peerId} policy=${this.config.policy || 'all'} turnConfigured=${hasTurn}`);
             let timer: ReturnType<typeof setTimeout> | undefined;
 
             const deadline = new Promise<boolean>(resolve => {
@@ -215,7 +249,7 @@ export class DirectTransport {
                 if (this.config.peerId < peerId && direct.pc.signalingState === 'stable')
                     await this.makeOffer(peerId, direct);
                 else if (this.config.peerId > peerId && direct.pc.signalingState === 'stable')
-                    await this.config.sendSignal(peerId, 'request', null);
+                    await this.config.sendSignal(peerId, 'request', { requestId: direct.requestId });
                 while (!direct.ready && this.current(peerId, direct))
                     await new Promise(resolve => setTimeout(resolve, 100));
                 return direct.ready && direct.channel?.readyState === 'open';
@@ -223,6 +257,8 @@ export class DirectTransport {
             try {
                 const ready = await Promise.race([negotiate(), deadline]);
                 if (!ready && this.current(peerId, direct)) {
+                    await this.diagnose(peerId, direct);
+                    if (direct.ready && this.current(peerId, direct)) return true;
                     this.fail(peerId, direct, `DIRECT timeout ${peerId}; RELAY fallback`);
                 }
                 return ready;
@@ -238,6 +274,12 @@ export class DirectTransport {
             }
         })();
         return direct.opening;
+    }
+    async retry(peerId: string) {
+        const existing = this.connections.get(peerId);
+        if (existing?.ready && existing.channel?.readyState === 'open') return true;
+        if (existing) { this.connections.delete(peerId); existing.stopOpening?.(); existing.pc.close(); }
+        return this.ensure(peerId, false);
     }
     send(peerId: string, packet: unknown) {
         const direct = this.connections.get(peerId), channel = direct?.channel;
@@ -260,5 +302,6 @@ export class DirectTransport {
         }
         this.connections.clear();
         this.signals.clear();
+        this.requests.clear();
     }
 }

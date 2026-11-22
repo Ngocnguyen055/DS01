@@ -2,7 +2,9 @@ import { z } from "zod";
 export const peerIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{3,32}$/);
 export const idSchema = z.string().uuid();
 export const MAX_CHAT_ATTACHMENTS = 3;
-export const MAX_CHAT_ATTACHMENT_BYTES = 512 * 1024;
+export const MAX_CHAT_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+export const FILE_CHUNK_BYTES = 2304;
+const MAX_FILE_CHUNKS = Math.ceil(MAX_CHAT_ATTACHMENT_BYTES / FILE_CHUNK_BYTES);
 export const MAX_DELIVERY_ATTEMPTS = 3;
 export const chatAttachmentSchema = z
     .object({
@@ -21,8 +23,8 @@ export const chatAttachmentSchema = z
 export type ChatAttachment = z.infer<typeof chatAttachmentSchema>;
 export const fileChunkSchema = z.object({
     transferId: idSchema,
-    index: z.number().int().min(0).max(255),
-    total: z.number().int().min(1).max(256),
+    index: z.number().int().min(0).max(MAX_FILE_CHUNKS - 1),
+    total: z.number().int().min(1).max(MAX_FILE_CHUNKS),
     data: z.string().min(1).max(3072).regex(/^[A-Za-z0-9+/]+={0,2}$/),
     file: chatAttachmentSchema.extend({ sha256: z.string().regex(/^[a-f0-9]{64}$/) }),
 }).strict().refine(chunk => chunk.index < chunk.total && chunk.file.id === chunk.transferId, 'invalid file chunk');
@@ -35,7 +37,7 @@ export const messageSchema = z
     receiverId: peerIdSchema,
     groupId: idSchema.nullish(),
     type: z.enum(["text", "attachment", "ack", "file-chunk"]),
-    timestamp: z.number().int().positive().safe(),
+    timestamp: z.number().int().positive(),
     body: z.string().max(4000),
     attachments: z
         .array(chatAttachmentSchema)
@@ -46,8 +48,8 @@ export const messageSchema = z
     ackRequested: z.boolean().optional(),
     ackFor: idSchema.optional(),
     attempt: z.number().int().min(1).max(MAX_DELIVERY_ATTEMPTS),
-    sequence: z.number().int().nonnegative().safe(),
-    logicalTime: z.number().int().nonnegative().safe().optional(),
+    sequence: z.number().int().nonnegative(),
+    logicalTime: z.number().int().nonnegative().optional(),
     fileChunk: fileChunkSchema.optional(),
 })
     .strict()
@@ -60,7 +62,7 @@ export const messageSchema = z
         ctx.addIssue({ code: 'custom', message: 'ackFor is only supported on ACK messages' });
     if (m.type === 'ack' && m.body.length)
         ctx.addIssue({ code: 'custom', message: 'ack cannot have a body' });
-    if (m.type === 'file-chunk' && (!m.fileChunk || m.groupId != null || m.attachments || m.body))
+    if (m.type === 'file-chunk' && (!m.fileChunk || m.attachments || m.body))
         ctx.addIssue({ code: 'custom', message: 'invalid file chunk envelope' });
     if (m.type !== 'file-chunk' && m.fileChunk)
         ctx.addIssue({ code: 'custom', message: 'unexpected file chunk' });
@@ -72,11 +74,6 @@ export const messageSchema = z
         ctx.addIssue({ code: "custom", message: "text cannot have attachments" });
     if (m.type === "attachment" && !m.attachments)
         ctx.addIssue({ code: "custom", message: "attachments required" });
-    if (m.type === "attachment" && m.groupId != null)
-        ctx.addIssue({
-            code: "custom",
-            message: "attachments are only supported in direct chat",
-        });
     if (m.type === "ack" && m.attachments)
         ctx.addIssue({ code: "custom", message: "ack cannot have attachments" });
 });
@@ -95,19 +92,35 @@ export type PeerPresence = {
     peerId: string;
     online: boolean;
 };
-export type PeerProfile = {
-    peerId: string;
-    displayName: string;
-    online: boolean;
-    lastSeen: number;
-};
-const peerConnectionSchema = z
+export const peerConnectionSchema = z
     .object({
     transport: z.literal("webrtc-datachannel"),
     signaling: z.literal("socket.io"),
     relay: z.literal("socket.io"),
 })
     .strict();
+export const DEFAULT_PEER_CONNECTION = Object.freeze({
+    transport: 'webrtc-datachannel' as const,
+    signaling: 'socket.io' as const,
+    relay: 'socket.io' as const,
+});
+export type PeerConnection = z.infer<typeof peerConnectionSchema>;
+export const peerRegistrationSchema = z.object({
+    peerId: peerIdSchema,
+    identityProof: z.string().min(16).max(4096),
+    displayName: z.string().trim().min(1).max(80).optional(),
+    status: z.literal('online').default('online'),
+    connection: peerConnectionSchema.default(DEFAULT_PEER_CONNECTION),
+}).strict();
+export const peerProfileSchema = z.object({
+    peerId: peerIdSchema,
+    displayName: z.string().trim().min(1).max(80),
+    status: z.literal('online'),
+    online: z.literal(true),
+    lastSeen: z.number().int().nonnegative(),
+    connection: peerConnectionSchema,
+}).strict();
+export type PeerProfile = z.infer<typeof peerProfileSchema>;
 export const peerDiscoverySchema = z.discriminatedUnion("online", [
     z
         .object({

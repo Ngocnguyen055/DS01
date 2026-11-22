@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
+import jwt from 'jsonwebtoken';
+import { io, type Socket } from 'socket.io-client';
+import { createRelay } from '../src/relay/index.ts';
 import { MAX_WIRE_BYTES, parseMessage, type ChatMessage } from '../src/shared/protocol.ts';
 import { MessageDelivery } from '../src/shared/messageDelivery.ts';
 import type { ChatStore, PeerEvent, StoredMessage } from '../src/shared/peerTypes.ts';
@@ -23,6 +27,7 @@ class MemoryStore implements ChatStore {
     async isDirectBlocked(peerId: string) { return peerId === 'peer-blocked'; }
 }
 const deliveries: MessageDelivery[] = [];
+const relays: ReturnType<typeof createRelay>[] = [], sockets: Socket[] = [];
 function delivery(peerId: string, store: MemoryStore, transport: (message: ChatMessage) => Promise<void>, events: PeerEvent[] = []) {
     const value = new MessageDelivery({ peerId, store, transport, ackTimeoutMs: 100, selectMode: async () => 'RELAY', getGroup: () => undefined,
         syncProjectGroup: async () => { throw Error('group denied'); }, authorizeGroup: async () => { throw Error('group denied'); }, emit: event => events.push(event), log: () => {} });
@@ -31,6 +36,8 @@ function delivery(peerId: string, store: MemoryStore, transport: (message: ChatM
 }
 afterEach(async () => {
     deliveries.splice(0).forEach(value => value.close());
+    sockets.splice(0).forEach(socket => socket.disconnect());
+    for (const relay of relays.splice(0)) await relay.close();
     vi.restoreAllMocks();
 });
 
@@ -98,6 +105,30 @@ describe('message structure required by DS01 section 5.7', () => {
         input.body = '漢'.repeat(Math.floor(available / 3)) + 'x'.repeat(available % 3);
         expect(Buffer.byteLength(JSON.stringify(input), 'utf8')).toBe(MAX_WIRE_BYTES);
         expect(() => parseMessage(input)).toThrow('message too large');
+    });
+
+    it('forwards a valid 8192-byte JSON envelope through Socket.IO framing and rejects 8193 bytes', async () => {
+        const relay = createRelay();
+        relays.push(relay);
+        await new Promise<void>(resolve => relay.httpServer.listen(0, '127.0.0.1', resolve));
+        const url = `http://127.0.0.1:${(relay.httpServer.address() as AddressInfo).port}`;
+        const [a, b] = await Promise.all(['peer-a', 'peer-b'].map(async peerId => {
+            const token = jwt.sign({ sub: peerId }, process.env.PEER_SECRET!, { expiresIn: '1h', audience: 'ds01-relay', issuer: 'ds01-signaling' });
+            const socket = io(url, { auth: { token }, transports: ['websocket'], reconnection: false });
+            sockets.push(socket);
+            await new Promise<void>((resolve, reject) => { socket.once('connect', resolve); socket.once('connect_error', reject); });
+            return socket;
+        }));
+        const input = { ...packet(), body: '', ackRequested: true }, received: ChatMessage[] = [];
+        const available = MAX_WIRE_BYTES - Buffer.byteLength(JSON.stringify(input), 'utf8');
+        input.body = '漢'.repeat(Math.floor(available / 3)) + 'x'.repeat(available % 3);
+        b.on('relay:receive', message => received.push(message));
+        const receivedOnce = new Promise<void>(resolve => b.once('relay:receive', () => resolve()));
+        expect(await a.timeout(1000).emitWithAck('relay:send', input)).toEqual({ ok: true });
+        await receivedOnce;
+        expect(received).toEqual([input]);
+        expect(await a.timeout(1000).emitWithAck('relay:send', { ...input, messageId: randomUUID(), body: input.body + 'x' })).toEqual({ ok: false, error: 'message too large' });
+        expect(received).toHaveLength(1);
     });
 
     it('acknowledges only after local persistence, identifies the original message and never ACKs an ACK', async () => {

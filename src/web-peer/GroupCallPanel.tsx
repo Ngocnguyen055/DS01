@@ -41,7 +41,7 @@ export function GroupCallPanel({ call, title, name, join, leave, mute, resumeAud
             <Participant call={{ remote: call.local, phase: 'connected' }} local name="Bạn" resume={resumeAudio}/>
             {call.peers.map(peer => <Participant key={peer.peerId} call={peer} name={name(peer.peerId)} resume={resumeAudio}/>)}
         </div>}
-        {active && call.peers.some(peer => peer.route === 'RELAY') && <p className="call-notice">Một số kết nối đang qua relay mã hóa; video được giảm chất lượng.</p>}
+        {active && call.peers.some(peer => peer.route === 'RELAY') && <p className="call-notice">Có kết nối qua relay, có mã hóa.{call.room.kind === 'video' && ' Video dùng chất lượng thấp hơn.'}</p>}
         {active && !call.peers.length && <p className="call-notice">Đang chờ thành viên tham gia. Tối đa {MAX_GROUP_CALL_PEERS} người trong một cuộc gọi.</p>}
         {call.error && <p role="alert">{call.error}</p>}
         <div className="call-actions">

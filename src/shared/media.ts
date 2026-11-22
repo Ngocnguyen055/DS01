@@ -52,6 +52,7 @@ export class MediaSession {
         prepare?: () => Promise<void>;
         stream?: () => Promise<MediaStream>;
         busy?: () => boolean;
+        simulateIceFailure?: () => boolean;
         fallbackMs?: number; disconnectGraceMs?: number;
         driver?: (options: ConstructorParameters<typeof RelayMedia>[0]) => RelayDriver;
         send: (to: string, signal: MediaSignal) => Promise<void>; emit: (state: CallState) => void; log: (value: string) => void }) {}
@@ -83,7 +84,10 @@ export class MediaSession {
         const stream = this.config.stream ? await this.config.stream() : await devices!.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: state.kind === 'video' });
         if (!this.current(generation)) { if (!this.config.stream) stream.getTracks().forEach(track => track.stop()); throw Error('call cancelled'); }
         state.local = stream;
-        const pc = this.pc = new this.config.rtc({ iceServers: this.config.iceServers || DEFAULT_ICE_SERVERS, iceTransportPolicy: this.config.policy || 'all' });
+        const blocked = this.config.simulateIceFailure?.() === true;
+        const pc = this.pc = new this.config.rtc(blocked ? { iceServers: [], iceTransportPolicy: 'relay' }
+            : { iceServers: this.config.iceServers || DEFAULT_ICE_SERVERS, iceTransportPolicy: this.config.policy || 'all' });
+        if (blocked) this.config.log('CALL_ICE_BLOCKED ' + state.callId + ' simulation=1');
         stream.getTracks().forEach(track => pc.addTrack(track, stream));
         this.announced = false;
         pc.onicecandidate = event => {
@@ -216,7 +220,12 @@ export class MediaSession {
             await this.fallback;
             if (!this.current(generation)) return;
             if (notify !== undefined) await this.config.send(state.peerId, { action: notify ? 'relay-request' : 'relay-ready', callId: state.callId });
-        } catch (error) { if (this.current(generation)) await this.end(this.errorText(error)); }
+        } catch (error) {
+            if (this.current(generation)) {
+                this.config.log('CALL_RELAY_ERROR ' + state.callId + ' peer=' + state.peerId + ' ' + this.errorText(error));
+                await this.end(this.errorText(error));
+            }
+        }
     }
     receiveFrame(input: unknown): Promise<void> {
         const parsed = mediaFrameSchema.safeParse(input);

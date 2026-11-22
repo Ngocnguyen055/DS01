@@ -32,7 +32,7 @@ export function CallPanel({ call, name, accept, end, mute, resumeAudio, dismiss 
             {call.remoteFrame && <img className="remote-video relay-video" src={call.remoteFrame} alt="Video từ peer qua relay"/>}
             <video ref={local} className="local-video" autoPlay playsInline muted aria-label="Camera của bạn"/>
         </div>
-        {call.route === 'RELAY' && active && <p className="call-notice">Đang dùng relay mã hóa. Video giảm chất lượng để duy trì cuộc gọi.</p>}
+        {call.route === 'RELAY' && active && <p className="call-notice">Cuộc gọi qua relay, có mã hóa.{call.kind === 'video' && ' Video dùng chất lượng thấp hơn.'}</p>}
         {active && (playbackBlocked || call.audioBlocked) && <button className="primary-button" onClick={enableAudio}>Bật âm thanh cuộc gọi</button>}
         {call.error && <p role="alert">{call.error}</p>}
         <div className="call-actions">

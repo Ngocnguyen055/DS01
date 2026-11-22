@@ -3,6 +3,7 @@ import { peerIdSchema } from "@ds01/shared";
 import { z } from 'zod';
 import type { SignalingContext, SignalingReply } from "./types.ts";
 import { serviceLog } from '../server-kit/runtime.ts';
+import { peerIsOnline } from './presence.ts';
 import { mediaSignalSchema } from '../shared/media.ts';
 import type { GroupCalls } from './groupCalls.ts';
 const sdp = (type: 'offer' | 'answer') => z.object({ type: z.literal(type), sdp: z.string().max(12000) }).strict();
@@ -45,7 +46,7 @@ export function registerWebRtcHandlers(socket: Socket, context: SignalingContext
         if (value.kind === 'media' && value.data.group && !groupCalls?.allowedSignal(senderId, value.to, value.data.group))
             return reply({ ok: false, error: 'group call access denied' });
         const target = context.peers.get(String(value.to));
-        if (!target || !target.socket.connected)
+        if (!target || !peerIsOnline(context, String(value.to), target))
             return reply?.({ ok: false, error: "peer offline" });
         target.socket.emit("signal:receive", {
             from: senderId,

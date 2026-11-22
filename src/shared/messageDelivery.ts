@@ -112,8 +112,6 @@ export class MessageDelivery {
     private createMessage(receiverId: string, body: string, groupId: string | null | undefined, messageId: string, sequenceOverride?: number, attachments?: ChatAttachment[], fileChunk?: FileChunk): ChatMessage {
         if (!body.trim() && !attachments?.length && !fileChunk)
             throw new Error("empty message");
-        if (attachments?.length && groupId)
-            throw new Error("attachments are only supported in direct chat");
         if (groupId && !this.config.getGroup(groupId)?.members.includes(receiverId))
             throw new Error("receiver not in group");
         const conversationKey = groupId || [this.config.peerId, receiverId].sort().join(":");
@@ -231,7 +229,7 @@ export class MessageDelivery {
                     this.pending.delete(`${messageId}:${receiverId}`);
                 }
                 lastFailure = String(error);
-                this.config.log(`send attempt ${attempt} failed: ${lastFailure} peer=${receiverId} message=${messageId} type=${message.type}`);
+                this.config.log(`send attempt ${attempt} failed: ${lastFailure} peer=${receiverId} message=${messageId} type=${message.type}${message.groupId ? ' group=' + message.groupId : ''}`);
                 if (this.closed)
                     break;
                 mode = "RELAY";
@@ -245,7 +243,7 @@ export class MessageDelivery {
                 message: { message: lastAccepted, status: "failed" },
             });
         }
-        throw new Error(`delivery failed to ${receiverId}${lastFailure ? ": " + lastFailure : ""}`);
+        throw new Error(`delivery failed to ${receiverId}${lastFailure ? ': ' + lastFailure : ''}`);
     }
     async sendDirect(receiverId: string, body: string): Promise<void> {
         peerIdSchema.parse(receiverId);
@@ -263,24 +261,24 @@ export class MessageDelivery {
             throw new Error("peer is blocked");
         await this.send(receiverId, caption.trim(), undefined, randomUUID(), undefined, attachments);
     }
-    async sendGroup(groupId: string, body: string): Promise<Record<string, string>> {
+    async sendGroup(groupId: string, body: string, attachments?: ChatAttachment[], onlyRecipients?: string[]): Promise<Record<string, string>> {
         await this.recover();
         const group = this.config.getGroup(groupId);
         if (!group || !group.members.includes(this.config.peerId))
             throw new Error("not a group member");
         const current = group.projectId
             ? await this.config.syncProjectGroup(group.projectId)
-            : group;
+            : await this.config.authorizeGroup(groupId, this.config.peerId);
         if (current.archived)
             throw new Error("project archived");
         const messageId = randomUUID();
         const sequence = (this.sequence.get(groupId) || 0) + 1;
         this.sequence.set(groupId, sequence);
-        const recipients = current.members.filter((peerId) => peerId !== this.config.peerId);
+        const recipients = current.members.filter((peerId) => peerId !== this.config.peerId && (!onlyRecipients || onlyRecipients.includes(peerId)));
         if (!recipients.length)
             throw new Error('add another member before sending');
 
-        const message = this.createMessage(recipients[0], body, groupId, messageId, sequence);
+        const message = this.createMessage(recipients[0], body, groupId, messageId, sequence, attachments);
         const results = await Promise.allSettled(recipients.map(peerId => this.exclusiveSend(messageId, peerId, () => this.deliver({ ...message, receiverId: peerId }))));
         return Object.fromEntries(recipients.map((peerId, index) => [peerId, results[index].status]));
     }
