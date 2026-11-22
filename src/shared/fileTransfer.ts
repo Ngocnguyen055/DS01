@@ -12,10 +12,12 @@ type Assembly = {
     parts: Map<number, Uint8Array>;
     updated: number;
     bytes: number;
+    timer?: ReturnType<typeof setTimeout>;
 };
 export class FileTransfer {
     private assemblies = new Map<string, Assembly>();
     private rejected = new Map<string, number>();
+    private closed = false;
     constructor(private config: {
         store: ChatStore;
         sendChunk: (peerId: string, chunk: FileChunk) => Promise<void>;
@@ -25,23 +27,48 @@ export class FileTransfer {
     private progress(chunk: FileChunk, peerId: string, direction: 'send' | 'receive', progress: number, status: 'transferring' | 'complete' | 'failed', error?: string) {
         this.config.emit({ kind: 'transfer', transfer: { id: chunk.transferId, name: chunk.file.name, peerId, direction, progress, status, error } });
     }
+    private assertOpen() {
+        if (this.closed)
+            throw new Error('file transfer closed');
+    }
+    private removeAssembly(key: string) {
+        clearTimeout(this.assemblies.get(key)?.timer);
+        this.assemblies.delete(key);
+    }
+    private expireAfterInactivity(key: string, item: Assembly) {
+        clearTimeout(item.timer);
+        item.timer = setTimeout(() => {
+            if (this.assemblies.get(key) !== item)
+                return;
+            this.removeAssembly(key);
+            this.progress(item.chunk, item.senderId, 'receive', 0, 'failed', 'file transfer timeout; send the file again');
+        }, 120000);
+
+        if (typeof item.timer === 'object')
+            item.timer.unref?.();
+    }
     async send(peerId: string, name: string, mime: string, data: Uint8Array) {
+        this.assertOpen();
         if (!this.config.store.putFile)
             throw new Error('file storage unsupported');
         if (!data.length || data.length > MAX_CHAT_ATTACHMENT_BYTES)
             throw new Error('File phải từ 1 byte đến 512 KiB');
         const file = { ...chatAttachmentSchema.parse({ id: randomUUID(), name, mime: mime || 'application/octet-stream', size: data.length }), sha256: await fileHash(data) };
+        this.assertOpen();
         const total = Math.ceil(data.length / CHUNK_BYTES);
         let last: FileChunk = { transferId: file.id, index: 0, total, data: '', file };
         try {
             await this.config.store.putFile(file, data);
             for (let index = 0; index < total; index++) {
+                this.assertOpen();
                 const bytes = data.subarray(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES);
                 last = { transferId: file.id, index, total, data: btoa(String.fromCharCode(...bytes)), file };
                 this.progress(last, peerId, 'send', Math.round(index / total * 100), 'transferring');
                 await this.config.sendChunk(peerId, last);
             }
+            this.assertOpen();
             await this.config.sendAttachment(peerId, file);
+            this.assertOpen();
             this.progress(last, peerId, 'send', 100, 'complete');
         }
         catch (error) {
@@ -50,6 +77,7 @@ export class FileTransfer {
         }
     }
     async receive(message: ChatMessage) {
+        this.assertOpen();
         const chunk = message.fileChunk;
         if (!chunk || !this.config.store.putFile || !this.config.store.getFile)
             throw new Error('file storage unsupported');
@@ -60,14 +88,17 @@ export class FileTransfer {
         if (bytes.length !== expectedSize)
             throw new Error('invalid chunk size');
         const complete = await this.config.store.getFile(chunk.transferId);
+        this.assertOpen();
         if (complete) {
             if (complete.file.sha256 !== chunk.file.sha256)
                 throw new Error('conflicting file');
             return;
         }
         for (const [key, item] of this.assemblies)
-            if (Date.now() - item.updated > 120000)
-                this.assemblies.delete(key);
+            if (Date.now() - item.updated > 120000) {
+                this.removeAssembly(key);
+                this.progress(item.chunk, item.senderId, 'receive', 0, 'failed', 'file transfer timeout; send the file again');
+            }
         const key = `${message.senderId}:${chunk.transferId}`;
         for (const [id, at] of this.rejected)
             if (Date.now() - at > 120000)
@@ -91,14 +122,19 @@ export class FileTransfer {
             item.bytes += bytes.length;
         }
         item.updated = Date.now();
+        this.expireAfterInactivity(key, item);
         this.progress(chunk, message.senderId, 'receive', Math.round(item.parts.size / chunk.total * 100), 'transferring');
         if (item.parts.size !== chunk.total)
             return;
         const data = new Uint8Array(chunk.file.size);
         for (let index = 0; index < chunk.total; index++)
             data.set(item.parts.get(index)!, index * CHUNK_BYTES);
-        if (item.bytes !== chunk.file.size || await fileHash(data) !== chunk.file.sha256) {
-            this.assemblies.delete(key);
+        const hash = await fileHash(data);
+        this.assertOpen();
+        if (this.assemblies.get(key) !== item)
+            throw new Error('file transfer interrupted');
+        if (item.bytes !== chunk.file.size || hash !== chunk.file.sha256) {
+            this.removeAssembly(key);
             this.rejected.set(key, Date.now());
             if (this.rejected.size > 128)
                 this.rejected.delete(this.rejected.keys().next().value!);
@@ -106,8 +142,18 @@ export class FileTransfer {
             throw new Error('SHA-256 mismatch');
         }
         await this.config.store.putFile(chunk.file, data);
-        this.assemblies.delete(key);
+        this.assertOpen();
+        if (this.assemblies.get(key) !== item)
+            throw new Error('file transfer interrupted');
+        this.removeAssembly(key);
         this.progress(chunk, message.senderId, 'receive', 100, 'complete');
     }
-    close() { this.assemblies.clear(); this.rejected.clear(); }
+    close() {
+        this.closed = true;
+        for (const [key, item] of this.assemblies) {
+            this.removeAssembly(key);
+            this.progress(item.chunk, item.senderId, 'receive', 0, 'failed', 'file transfer closed');
+        }
+        this.rejected.clear();
+    }
 }
