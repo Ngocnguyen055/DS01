@@ -1,5 +1,5 @@
 import type { StoredMessage } from './peerTypes.ts';
-/** Stable merge of sender/session sequence chains. Does not claim total causal order. */
+
 export function orderMessages(rows: StoredMessage[]): StoredMessage[] {
     const chains = new Map<string, StoredMessage[]>();
     for (const row of rows) {
