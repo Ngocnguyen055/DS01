@@ -23,11 +23,11 @@ Bài tập lớn môn **Hệ thống phân tán**, đề tài **DS01**, nhóm **
 
 ## 1. Thành viên và phân công
 
-| Thành viên | Phần việc | Mã nguồn chính |
-| --- | --- | --- |
-| **Hồng** · `hong0110` | B1: signaling, discovery và tài khoản; B3: relay và định tuyến; N1: đa relay, lựa chọn và failover; N6: truyền file; N8: tải và đánh giá hiệu năng | `src/signaling/`, `src/server-kit/`, `src/relay/index.ts`, `src/shared/peer.ts`, `relaySelection.ts`, `fileTransfer.ts`; các script workload và test tương ứng |
-| **Nam** · `Namtran205` | B2: WebRTC, NAT, STUN/TURN và chuyển đường truyền; B4: giao thức, ACK/retry/dedup và ordering; N2: replication/mailbox; N3: bầu super-peer; N7: thoại/video; D1: triển khai và CI/CD | `src/shared/directTransport.ts`, `messageDelivery.ts`, `protocol.ts`, `media.ts`, `groupMedia.ts`; `src/relay/cluster.ts`, `journal.ts`; `deploy/`, `.github/` |
-| **Ngọc** · `Ngocnguyen055` | B5: chat nhóm và membership/OCC; B6: giao diện và lịch sử; N4: E2EE, quản lý khóa và đồng bộ tài khoản; N5: DHT; C3: biên tập báo cáo | `src/signaling/groupHandlers.ts`, `keyDirectory.ts`; `src/shared/secure.ts`, `overlayProtocol.ts`; `src/web-peer/`, `docs/report.*` |
+| Thành viên | MSSV | Phần việc | Mã nguồn chính |
+| --- | --- | --- | --- |
+| **Trịnh Thu Hồng** · `hong0110` | **B23DCVT180** | B1: signaling, discovery và tài khoản; B3: relay và định tuyến; N1: đa relay, lựa chọn và failover; N6: truyền file; N8: tải và đánh giá hiệu năng | `src/signaling/`, `src/server-kit/`, `src/relay/index.ts`, `src/shared/peer.ts`, `relaySelection.ts`, `fileTransfer.ts`; các script workload và test tương ứng |
+| **Trần Hoàng Nam** · `Namtran205` | **B23DCCE070** | B2: WebRTC, NAT, STUN/TURN và chuyển đường truyền; B4: giao thức, ACK/retry/dedup và ordering; N2: replication/mailbox; N3: bầu super-peer; N7: thoại/video; D1: triển khai và CI/CD | `src/shared/directTransport.ts`, `messageDelivery.ts`, `protocol.ts`, `media.ts`, `groupMedia.ts`; `src/relay/cluster.ts`, `journal.ts`; `deploy/`, `.github/` |
+| **Nguyễn Chí Ngọc** · `Ngocnguyen055` | **B23DCCE073** | B5: chat nhóm và membership/OCC; B6: giao diện và lịch sử; N4: E2EE, quản lý khóa và đồng bộ tài khoản; N5: DHT; C3: biên tập báo cáo | `src/signaling/groupHandlers.ts`, `keyDirectory.ts`; `src/shared/secure.ts`, `overlayProtocol.ts`; `src/web-peer/`, `docs/report.*` |
 
 Các file tích hợp như `peer.ts`, signaling/relay `index.ts` và `useWebPeer.ts` có phần phối hợp của nhiều thành viên. Nền chung gồm cấu hình workspace, công cụ chạy, thư viện đường dẫn lưu trữ và thiết lập test. Cả ba cùng phân tích, tích hợp, nghiệm thu và trình bày; mỗi người viết test và nội dung báo cáo cho phần mình phụ trách.
 
