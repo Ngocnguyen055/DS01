@@ -1,8 +1,9 @@
 import type { ChatAttachment, ChatMessage, DeliveryMode, Group, PeerProfile } from "./protocol.ts";
-export type MessageStatus = "pending" | "sent" | "delivered" | "failed" | "received";
+export type MessageStatus = "pending" | "sent" | "forwarded" | "queued" | "delivered" | "failed" | "received";
 export type StoredMessage = {
     message: ChatMessage;
     status: MessageStatus;
+    queuedUntil?: number;
 };
 export type DirectChatContact = {
     peerId: string;
@@ -10,13 +11,13 @@ export type DirectChatContact = {
     email: string;
     updatedAt: number;
 };
-/** Persistence boundary implemented by SQLite on mobile and localStorage on web. */
+
 export interface ChatStore {
     put(row: StoredMessage): Promise<void>;
     mark(messageId: string, receiverId: string, status: MessageStatus): Promise<void>;
     has(messageId: string, senderId: string): Promise<boolean>;
     list(): Promise<StoredMessage[]>;
-    /** Reject an already-open direct channel after the local user blocks a peer. */
+
     isDirectBlocked?(peerId: string): Promise<boolean>;
     putFile?(file: ChatAttachment, data: Uint8Array): Promise<void>;
     getFile?(fileId: string): Promise<{
@@ -38,7 +39,12 @@ export interface DirectChatStore extends ChatStore {
 }
 export type RTCFactory = new (config: RTCConfiguration) => RTCPeerConnection;
 export type PeerEvent = {
-    kind: "message" | "presence" | "group" | "mode" | "log" | "connection" | "transfer" | "auth-expired";
+    kind: "message" | "presence" | "group" | "mode" | "log" | "connection" | "transfer" | "auth-expired" | 'call' | 'group-call' | 'relay-metrics' | 'superpeer';
+    call?: import('./media.ts').CallState;
+    groupCall?: import('./groupCallProtocol.ts').GroupCallState;
+    groupCalls?: import('./groupCallProtocol.ts').GroupCallRoom[];
+    relayMetrics?: import('./relaySelection.ts').RelaySample[];
+    leader?: { peerId: string; url: string; leaseUntil: number } | null;
     message?: StoredMessage;
     peers?: string[];
     group?: Group;
@@ -73,6 +79,16 @@ export type PeerConfig = {
     forceRelay?: boolean;
     iceServers?: RTCIceServer[];
     directTimeoutMs?: number;
+
+    requestTimeoutMs?: number;
     ackTimeoutMs?: number;
+    encryption?: boolean;
+    identityStore?: import('./secure.ts').IdentityStore;
+    relaySelection?: 'priority' | 'latency-load';
+    discovery?: 'signaling' | 'dht';
+    dhtLeaseMs?: number;
+    rtcPolicy?: RTCIceTransportPolicy;
+    mediaDevices?: Pick<MediaDevices, 'getUserMedia'>;
+    simulateMediaIceFailure?: boolean;
     onEvent: (event: PeerEvent) => void;
 };

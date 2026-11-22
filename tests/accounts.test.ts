@@ -50,10 +50,16 @@ describe('account authentication', () => {
         expect(() => new Accounts(path).resolve(next.token)).toThrow();
     }, 15000);
     it('accepts exactly one simultaneous registration for a normalized username', async () => {
-        const accounts = new Accounts();
+        const path = join(folder(), 'accounts.json');
+        const accounts = new Accounts(path);
         const result = await Promise.allSettled([accounts.register(registration, 'a'), accounts.register({ ...registration, username: 'ALICE' }, 'b')]);
         expect(result.filter(value => value.status === 'fulfilled')).toHaveLength(1);
         expect(result.filter(value => value.status === 'rejected')).toHaveLength(1);
+        const persisted = JSON.parse(readFileSync(path, 'utf8'));
+        expect(persisted.users).toHaveLength(1);
+        expect(persisted.users[0]).toMatchObject({ username: 'alice', peerId: 'user_alice' });
+        const restored = new Accounts(path);
+        expect((await restored.login(credentials, 'restored', () => false)).account.peerId).toBe('user_alice');
     }, 15000);
     it('rejects invalid data, wrong credentials and login while the account peer is online', async () => {
         const accounts = new Accounts();

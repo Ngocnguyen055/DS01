@@ -1,8 +1,7 @@
-// User-run protocol probes. Does not start, patch, or deploy application services.
 import { config as loadEnv } from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { io } from 'socket.io-client';
+import { connectProbe } from './connect-probe.mjs';
 loadEnv({ path: fileURLToPath(new URL('../.env', import.meta.url)) });
 const [mode = 'help', ...args] = process.argv.slice(2);
 const option = (key, fallback) => {
@@ -34,15 +33,7 @@ async function waitFor(predicate, timeoutMs = 3000) {
     return false;
 }
 async function connect(url, auth) {
-    const socket = io(url, { autoConnect: false, transports: ['websocket'], reconnection: false, auth });
-    sockets.push(socket);
-    await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Connection timeout')), 5000);
-        socket.once('connect', () => { clearTimeout(timer); resolve(); });
-        socket.once('connect_error', error => { clearTimeout(timer); reject(error); });
-        socket.connect();
-    });
-    return socket;
+    return connectProbe(url, auth, socket => sockets.push(socket));
 }
 const call = (socket, event, ...payload) => socket.timeout(4000).emitWithAck(event, ...payload);
 async function register(id, proof = randomUUID() + randomUUID(), heartbeat = true) {
@@ -64,15 +55,18 @@ async function peers(count = 3) {
     return result;
 }
 function packet(senderId, receiverId, extra = {}) {
-    return { messageId: randomUUID(), sessionId: randomUUID(), senderId, receiverId, type: 'text', timestamp: Date.now(), body: `qa-message-${suffix}`, mode: 'RELAY', attempt: 1, sequence: 1, ...extra };
+    return { messageId: randomUUID(), sessionId: randomUUID(), senderId, receiverId, type: 'text', timestamp: Date.now(), body: `qa-message-${suffix}`, mode: 'RELAY', ackRequested: true, attempt: 1, sequence: 1, ...extra };
 }
 async function healthy(url) {
-    try {
-        return (await fetch(`${url.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(2000) })).ok;
+    const local = ['localhost', '127.0.0.1', '[::1]'].includes(new URL(url).hostname);
+    for (let attempt = 0; attempt < (local ? 1 : 2); attempt++) {
+        try {
+            const response = await fetch(`${url.replace(/\/$/, '')}/health`, { signal: AbortSignal.timeout(local ? 2000 : 4000) });
+            if (response.ok && ['signaling', 'relay'].includes((await response.json()).service)) return true;
+        } catch {}
+        if (!local && attempt === 0) await sleep(250);
     }
-    catch {
-        return false;
-    }
+    return false;
 }
 function requireLocal() {
     for (const url of [signalUrl, relayUrl]) {
@@ -120,7 +114,7 @@ const modes = {
             ['invalid UUID', { messageId: 'not-a-uuid' }],
             ['invalid Peer ID', { receiverId: '../invalid' }],
             ['empty text', { body: '   ' }],
-            ['ACK without ackFor', { type: 'ack', body: '' }],
+            ['ACK without ackFor', { type: 'ack', body: '', ackRequested: false }],
             ['DIRECT packet sent to relay', { mode: 'DIRECT' }],
         ];
         for (const [label, extra] of invalid) {
@@ -137,7 +131,7 @@ const modes = {
             await connect(relayUrl, { token: 'invalid-test-token' });
             invalidTokenAccepted = true;
         }
-        catch { /* expected */ }
+        catch {   }
         check('invalid relay token rejected', !invalidTokenAccepted);
         const invalidRegistration = await connect(signalUrl);
         const badId = await call(invalidRegistration, 'peer:register', { peerId: '../bad', identityProof: randomUUID() });
@@ -240,7 +234,7 @@ if (mode === 'help' || mode === '--help') {
     console.log(`Cases: ${Object.keys(modes).join(', ')}`);
     console.log('Run the application servers separately. blackhole holds for 60s; lease for up to 40s.');
     console.log('crash-* deliberately sends malformed input to localhost only; run last in a disposable lab.');
-    console.log('No tokens or peer secrets are printed. See docs/MANUAL-ACCEPTANCE.md for expected UI evidence.');
+    console.log('No tokens or peer secrets are printed. Compare Message IDs, peer delivery status and service logs; see README.md.');
 }
 else if (!modes[mode]) {
     console.error('Unknown case. Use --help.');
