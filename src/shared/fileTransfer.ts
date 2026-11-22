@@ -1,7 +1,7 @@
 import { randomUUID } from './uuid.ts';
-import { chatAttachmentSchema, MAX_CHAT_ATTACHMENT_BYTES, type ChatMessage, type FileChunk } from './protocol.ts';
+import { chatAttachmentSchema, MAX_CHAT_ATTACHMENT_BYTES, FILE_CHUNK_BYTES, type ChatMessage, type FileChunk } from './protocol.ts';
 import type { ChatStore, PeerEvent } from './peerTypes.ts';
-const CHUNK_BYTES = 2304;
+const CHUNK_BYTES = FILE_CHUNK_BYTES;
 export async function fileHash(data: Uint8Array): Promise<string> {
     const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(data).buffer);
     return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
@@ -20,8 +20,9 @@ export class FileTransfer {
     private closed = false;
     constructor(private config: {
         store: ChatStore;
-        sendChunk: (peerId: string, chunk: FileChunk) => Promise<void>;
+        sendChunk: (peerId: string, chunk: FileChunk, groupId?: string) => Promise<void>;
         sendAttachment: (peerId: string, file: FileChunk['file']) => Promise<void>;
+        sendGroupAttachment?: (groupId: string, file: FileChunk['file'], recipients: string[]) => Promise<Record<string, string>>;
         emit: (event: PeerEvent) => void;
     }) { }
     private progress(chunk: FileChunk, peerId: string, direction: 'send' | 'receive', progress: number, status: 'transferring' | 'complete' | 'failed', error?: string) {
@@ -48,33 +49,67 @@ export class FileTransfer {
             item.timer.unref?.();
     }
     async send(peerId: string, name: string, mime: string, data: Uint8Array) {
+        await this.sendTo([peerId], name, mime, data);
+    }
+    async sendGroup(groupId: string, recipients: string[], name: string, mime: string, data: Uint8Array) {
+        if (!this.config.sendGroupAttachment) throw Error('group file transfer unsupported');
+        return this.sendTo([...new Set(recipients)], name, mime, data, groupId);
+    }
+    private async sendTo(recipients: string[], name: string, mime: string, data: Uint8Array, groupId?: string) {
         this.assertOpen();
+        if (!recipients.length) throw Error('Không có thành viên khác để nhận file.');
         if (!this.config.store.putFile)
             throw new Error('file storage unsupported');
         if (!data.length || data.length > MAX_CHAT_ATTACHMENT_BYTES)
-            throw new Error('File phải từ 1 byte đến 512 KiB');
+            throw new Error('File phải từ 1 byte đến 20 MiB');
         const file = { ...chatAttachmentSchema.parse({ id: randomUUID(), name, mime: mime || 'application/octet-stream', size: data.length }), sha256: await fileHash(data) };
         this.assertOpen();
         const total = Math.ceil(data.length / CHUNK_BYTES);
-        let last: FileChunk = { transferId: file.id, index: 0, total, data: '', file };
-        try {
-            await this.config.store.putFile(file, data);
-            for (let index = 0; index < total; index++) {
+        await this.config.store.putFile(file, data);
+        const successful: string[] = [], failed: string[] = [];
+        for (const peerId of recipients) {
+            let last: FileChunk = { transferId: file.id, index: 0, total, data: '', file };
+            try {
+            for (let index = 0; index < total; index += 4) {
                 this.assertOpen();
-                const bytes = data.subarray(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES);
-                last = { transferId: file.id, index, total, data: btoa(String.fromCharCode(...bytes)), file };
+                const started = Date.now();
                 this.progress(last, peerId, 'send', Math.round(index / total * 100), 'transferring');
-                await this.config.sendChunk(peerId, last);
+                const batch = Array.from({ length: Math.min(4, total - index) }, (_, offset) => {
+                    const part = index + offset, bytes = data.subarray(part * CHUNK_BYTES, (part + 1) * CHUNK_BYTES);
+                    last = { transferId: file.id, index: part, total, data: btoa(String.fromCharCode(...bytes)), file };
+                    return this.config.sendChunk(peerId, last, groupId);
+                });
+                const results = await Promise.allSettled(batch);
+                const error = results.find(result => result.status === 'rejected');
+                if (error?.status === 'rejected') throw error.reason;
+                const delay = 100 - (Date.now() - started);
+                if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
             }
             this.assertOpen();
-            await this.config.sendAttachment(peerId, file);
+            if (!groupId) await this.config.sendAttachment(peerId, file);
             this.assertOpen();
-            this.progress(last, peerId, 'send', 100, 'complete');
+            successful.push(peerId);
+            this.progress(last, peerId, 'send', groupId ? 99 : 100, groupId ? 'transferring' : 'complete');
+            } catch (error) {
+                this.progress(last, peerId, 'send', 0, 'failed', String(error));
+                if (!groupId) throw error;
+                failed.push(peerId);
+            }
         }
-        catch (error) {
-            this.progress(last, peerId, 'send', 0, 'failed', String(error));
-            throw error;
+        if (groupId && successful.length) {
+            const last = { transferId: file.id, file, index: total - 1, total, data: '' };
+            try {
+                const result = await this.config.sendGroupAttachment!(groupId, file, successful);
+                for (const id of successful) {
+                    if (result[id] === 'fulfilled') this.progress(last, id, 'send', 100, 'complete');
+                    else { failed.push(id); this.progress(last, id, 'send', 99, 'failed', 'Chưa nhận được ACK cho file.'); }
+                }
+            } catch (error) {
+                for (const id of successful) this.progress(last, id, 'send', 99, 'failed', String(error));
+                throw error;
+            }
         }
+        if (failed.length) throw Error('Chưa gửi được file đến: ' + failed.join(', ') + '. Người nhận cần trực tuyến và còn trong nhóm.');
     }
     async receive(message: ChatMessage) {
         this.assertOpen();

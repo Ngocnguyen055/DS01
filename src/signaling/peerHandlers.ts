@@ -102,11 +102,13 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
         socket.emit("peer:ready");
         context.publishPresence();
     });
-    socket.on("peer:heartbeat", () => {
+    const renewLease = () => {
         const peerId = context.peerFor(socket);
         if (peerId && context.peers.get(peerId)?.socket.id === socket.id)
             context.peers.get(peerId)!.lastSeen = Date.now();
-    });
+    };
+    socket.on("peer:heartbeat", renewLease);
+    socket.conn.on('heartbeat', renewLease);
     socket.on("peer:list", (reply: SignalingReply) => {
         if (typeof reply !== "function")
             return;
@@ -162,7 +164,7 @@ export function registerPeerHandlers(socket: Socket, context: SignalingContext) 
         reply({ ok: true, peer: peerDiscoverySchema.parse(peer) });
     });
     socket.on("disconnect", () => {
-
+        socket.conn.off('heartbeat', renewLease);
         const peerId = socket.data.peerId as string | undefined;
         if (peerId && context.peers.get(peerId)?.socket.id === socket.id) {
             context.peers.delete(peerId);

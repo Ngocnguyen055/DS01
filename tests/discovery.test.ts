@@ -114,6 +114,31 @@ describe('joining and peer discovery', () => {
         await vi.advanceTimersByTimeAsync(5000);
         expect(signal.peers.has('peer-a')).toBe(true);
     });
+    it('renews a live transport when the browser application heartbeat timer is suspended', async () => {
+        const signal = createSignaling();
+        signal.io.engine.opts.pingInterval = 20;
+        const url = await listen(signal), socket = await connect(url);
+        expect((await register(socket, 'peer-a')).ok).toBe(true);
+        const peer = signal.peers.get('peer-a')!, now = Date.now();
+        peer.lastSeen = now - 29000;
+        const heartbeat = new Promise<void>(resolve => peer.socket.conn.once('heartbeat', resolve));
+        await heartbeat;
+        expect(peer.lastSeen).toBeGreaterThanOrEqual(now);
+        expect((await socket.timeout(2000).emitWithAck('peer:list')).peers).toEqual(['peer-a']);
+    });
+    it.each(['expired-lease', 'expired-auth'] as const)('does not revive %s from transport pongs', async reason => {
+        const signal = createSignaling();
+        signal.io.engine.opts.pingInterval = 20;
+        const url = await listen(signal), socket = await connect(url);
+        expect((await register(socket, 'peer-a')).ok).toBe(true);
+        const peer = signal.peers.get('peer-a')!, now = Date.now();
+        peer.lastSeen = now - (reason === 'expired-lease' ? 30000 : 1000);
+        if (reason === 'expired-auth') peer.socket.data.authExpiresAt = now;
+        const previous = peer.lastSeen;
+        await new Promise<void>(resolve => peer.socket.conn.once('heartbeat', resolve));
+        expect(peer.lastSeen).toBe(previous);
+        expect((await socket.timeout(2000).emitWithAck('peer:list')).ok).toBe(false);
+    });
 
     it('allows exactly one concurrent registration for a Peer ID and safely replaces an expired connection', async () => {
         vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });

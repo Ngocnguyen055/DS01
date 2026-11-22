@@ -2,6 +2,12 @@
   "name": "ds01-p2p-chat",
   "version": "1.0.0",
   "private": true,
+  "overrides": {
+    "node-turn": {
+      "log4js": "6.9.1",
+      "js-yaml": "3.15.2"
+    }
+  },
   "type": "module",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
@@ -21,22 +27,32 @@
     "build:web": "npm run build -w @ds01/web-peer",
     "typecheck": "tsc --noEmit -p src/shared && tsc --noEmit -p src/signaling && tsc --noEmit -p src/relay && tsc --noEmit -p src/web-peer && tsc --noEmit -p scripts && tsc --noEmit -p tests",
     "lint": "eslint src tests scripts --ext .ts,.tsx",
-    "test": "vitest run",
-    "test:core": "vitest run",
-    "benchmark:relay": "tsx scripts/benchmark-relay.ts",
+    "test": "node scripts/run-tests.mjs",
+    "test:core": "node scripts/run-tests.mjs",
+    "benchmark:relay": "node scripts/run-node.mjs benchmark",
     "load:relay": "node scripts/load-relay.mjs",
     "test:browser": "node scripts/browser-smoke.mjs",
+    "test:browser:advanced": "node scripts/browser-advanced.mjs",
+    "test:browser:groups": "node scripts/browser-group-calls.mjs",
+    "test:browser:accounts": "node scripts/browser-account-recovery.mjs",
+    "test:advanced": "node scripts/run-tests.mjs advanced.test.ts",
+    "evaluate": "node scripts/evaluate.mjs",
+    "demo:check": "node scripts/demo-public.mjs --check",
+    "demo:local": "node scripts/demo-public.mjs --local",
+    "demo:public": "node scripts/demo-public.mjs --public",
+    "demo:public:check": "node scripts/demo-public.mjs --public-check",
     "setup:env": "node scripts/init-env.mjs",
     "build:report": "node scripts/build-report.mjs"
   },
   "devDependencies": {
-    "esbuild": "^0.28.2",
     "@types/node": "^22.15.0",
-    "@typescript-eslint/eslint-plugin": "^8.35.0",
-    "@typescript-eslint/parser": "^8.35.0",
+    "@typescript-eslint/eslint-plugin": "^8.73.0",
+    "@typescript-eslint/parser": "^8.73.0",
+    "esbuild": "^0.28.2",
     "eslint": "^9.30.0",
+    "node-turn": "0.0.6",
     "tsx": "^4.20.0",
     "typescript": "^5.8.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.12"
   }
 }

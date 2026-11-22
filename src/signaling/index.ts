@@ -20,6 +20,9 @@ import { KeyDirectory } from './keyDirectory.ts';
 import { projectRoot, dataRoot } from '../server-kit/storagePaths.mjs';
 import { join, dirname } from 'node:path';
 import { AccountData, registerAccountData } from './accountData.ts';
+import { GroupCalls } from './groupCalls.ts';
+import { groupCallContextSchema } from '../shared/groupCallProtocol.ts';
+import { peerIdSchema } from '@ds01/shared';
 export type { DirectChatAuthorizer } from "./types.ts";
 if (process.env.NODE_ENV !== 'test') loadEnv({ path: join(projectRoot, '.env') });
 const HEARTBEAT_FRESH_MS = 30000;
@@ -31,6 +34,7 @@ if (PEER_SECRET === JWT_SECRET)
 export function createSignaling(httpServer: HttpServer = createServer(), directory: ProjectDirectory = httpProjectDirectory(), authorizeDirect: DirectChatAuthorizer = createHttpDirectChatAuthorizer(PEER_SECRET), options: {
     statePath?: string;
     accountStatePath?: string;
+    groupCallLeaseMs?: number;
 } = {}) {
     const app = express();
     const accounts = new Accounts(options.accountStatePath || (options.statePath ? `${options.statePath}.accounts.json` : undefined));
@@ -52,6 +56,8 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
     const io = new Server(httpServer, {
         cors: { origin: "*" },
         maxHttpBufferSize: 16384,
+        pingInterval: 10000,
+        pingTimeout: 20000,
     });
     const publishGroup = (group: Group) => {
         const before = groups.get(group.id);
@@ -103,6 +109,13 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
             return peerId && peer?.socket.id === socket.id && peerIsOnline(context, peerId, peer) ? peerId : undefined;
         },
     };
+    const groupCalls = new GroupCalls(context, options.groupCallLeaseMs);
+    app.get('/internal/group-calls/authorize', (req, res) => {
+        if (req.header('x-peer-secret') !== PEER_SECRET) return res.sendStatus(403);
+        const scope = groupCallContextSchema.safeParse({ groupId: req.query.groupId, roomId: req.query.roomId });
+        const sender = peerIdSchema.safeParse(req.query.senderId), receiver = peerIdSchema.safeParse(req.query.receiverId);
+        return res.json({ allowed: scope.success && sender.success && receiver.success && groupCalls.allowed(sender.data, receiver.data, scope.data) });
+    });
     app.get("/health", (_req, res) => res.json({ service: "signaling", peers: context.onlineProfiles().length }));
     app.get('/internal/sessions/authorize', (req, res) => {
         if (req.header('x-peer-secret') !== PEER_SECRET) return res.sendStatus(403);
@@ -122,12 +135,13 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
         }
     });
     io.on("connection", (socket) => {
-        guardSocket(socket, 'signal', ['auth:register', 'auth:login', 'auth:session', 'auth:logout', 'peer:register', 'peer:list', 'peer:lookup', 'signal:send', 'key:publish', 'key:lookup', 'project:group', 'group:authorize', 'group:create', 'group:change']);
+        guardSocket(socket, 'signal', ['auth:register', 'auth:login', 'auth:session', 'auth:logout', 'peer:register', 'peer:list', 'peer:lookup', 'signal:send', 'key:publish', 'key:lookup', 'project:group', 'group:authorize', 'group:create', 'group:change', 'group-call:control']);
         keys.register(socket, context);
         registerAuthHandlers(socket, accounts, context);
         registerPeerHandlers(socket, context);
         registerGroupHandlers(socket, context);
-        registerWebRtcHandlers(socket, context);
+        groupCalls.register(socket);
+        registerWebRtcHandlers(socket, context, groupCalls);
     });
     const stopMaintenance = startSignalingMaintenance(context);
     return {
@@ -138,6 +152,7 @@ export function createSignaling(httpServer: HttpServer = createServer(), directo
         httpServer,
         close: async () => {
             stopMaintenance();
+            groupCalls.close();
             await new Promise<void>((resolve) => io.close(() => resolve()));
             await new Promise<void>((resolve) => httpServer.close(() => resolve()));
         },

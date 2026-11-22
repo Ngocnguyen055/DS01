@@ -10,6 +10,10 @@ import { RelaySelector } from './relaySelection.ts';
 import { createOverlayRecord, verifyOverlayRecord, superPeerSchema, type OverlayRecord } from './overlayProtocol.ts';
 import { signIdentity } from './secure.ts';
 import { MediaSession } from './media.ts';
+import type { MediaFrame, MediaLink } from './mediaProtocol.ts';
+import { GroupMediaSession } from './groupMedia.ts';
+import { RelayMedia } from './relayMedia.ts';
+import type { GroupCallContext, GroupCallRoom } from './groupCallProtocol.ts';
 export type { ChatStore, DirectChatContact, DirectChatStore, MessageStatus, PeerConfig, PeerEvent, RTCFactory, StoredMessage, } from "./peerTypes.ts";
 type Ack = {
     ok: boolean;
@@ -27,6 +31,8 @@ type Ack = {
     result?: unknown;
     load?: { nodeId: string; peers: number; pending: number };
     leader?: { peerId: string; url: string; leaseUntil: number } | null;
+    room?: GroupCallRoom;
+    rooms?: GroupCallRoom[];
 };
 export class PeerClient {
     private started = false;
@@ -50,6 +56,7 @@ export class PeerClient {
     private closed = false;
     readonly secure: SecureChannel;
     readonly media: MediaSession;
+    readonly groupMedia: GroupMediaSession;
     readonly relaySelector = new RelaySelector();
     private relayToken?: string;
     private advancedTimer?: ReturnType<typeof setInterval>;
@@ -57,6 +64,7 @@ export class PeerClient {
     private refreshingOverlay = false;
     private dhtRecord?: OverlayRecord;
     forceRelay: boolean;
+    simulateMediaIceFailure: boolean;
     disconnectDirect(peerId: string) {
         peerIdSchema.parse(peerId);
         return !this.closed && this.directTransport.disconnect(peerId);
@@ -64,6 +72,7 @@ export class PeerClient {
     constructor(private config: PeerConfig) {
         this.peerId = config.peerId;
         this.forceRelay = !!config.forceRelay;
+        this.simulateMediaIceFailure = !!config.simulateMediaIceFailure;
         this.secure = new SecureChannel(config.peerId, async peerId => {
             if (config.discovery === 'dht') {
                 const result = await this.overlayCall('dht:key', peerId);
@@ -71,7 +80,7 @@ export class PeerClient {
             }
             if (!this.signal?.connected) throw Error('security key directory unavailable');
             const response = await this.call(this.signal, 'key:lookup', peerId);
-            if (!response.ok) throw Error(response.error || 'security key unavailable');
+            if (!response.ok) throw Error(`${response.error || 'security key unavailable'} (peer=${peerId})`);
             const key = publicIdentitySchema.parse(response.key), pin = await config.identityStore?.getPin(peerId), rotation = response.rotation;
             if (pin && canonical(pin) !== canonical(key) && rotation?.signature && rotation.vault && rotation.previousKey && canonical(pin) === canonical(rotation.previousKey)) {
                 const vault = accountVaultSchema.parse(rotation.vault);
@@ -79,8 +88,31 @@ export class PeerClient {
             }
             return key;
         }, config.identityStore);
-        this.media = new MediaSession({ rtc: config.rtc, iceServers: config.iceServers, policy: config.rtcPolicy, devices: config.mediaDevices,
-            send: (to, data) => this.sendSignal(to, 'media', data), emit: call => this.emit({ kind: 'call', call }), log: text => this.log(text) });
+        const mediaOptions = { rtc: config.rtc, iceServers: config.iceServers, policy: config.rtcPolicy, devices: config.mediaDevices,
+            simulateIceFailure: () => this.simulateMediaIceFailure,
+            prepare: async () => {
+                if (config.discovery === 'dht' || config.encryption) return;
+                if (!this.signal?.connected) throw Error('signaling unavailable');
+                const response = await this.call(this.signal, 'key:publish', await this.secure.publicIdentity());
+                if (!response.ok) throw Error(response.error || 'cannot publish call security key');
+            },
+            cipher: (peerId: string, callId: string) => this.secure.mediaCipher(peerId, callId), log: (text: string) => this.log(text) };
+        this.media = new MediaSession({ ...mediaOptions, busy: () => this.groupMedia?.isActive(),
+            relay: (peerId, callId) => this.openMediaRelay(peerId, callId),
+            send: (to, data) => this.sendSignal(to, 'media', data), emit: call => this.emit({ kind: 'call', call }) });
+        this.groupMedia = new GroupMediaSession({ peerId: this.peerId, devices: config.mediaDevices, busy: () => this.media.isActive(),
+            control: async input => {
+                if (config.discovery === 'dht' || !this.signal?.connected) throw Error('Cuộc gọi nhóm cần kết nối signaling.');
+                const response = await this.call(this.signal, 'group-call:control', input);
+                if (!response.ok) throw Error(response.error || 'group call unavailable');
+                return response;
+            },
+            create: (_peerId, scope, stream, context, emit) => new MediaSession({ ...mediaOptions, stream: async () => stream,
+                driver: options => new RelayMedia(options, context),
+                relay: (peerId, callId) => this.openMediaRelay(peerId, callId, { groupId: scope.groupId, roomId: scope.roomId }),
+                send: (to, data) => this.sendSignal(to, 'media', { ...data, group: scope }), emit }),
+            emit: (groupCall, groupCalls) => this.emit({ kind: 'group-call', groupCall, groupCalls }), log: text => this.log(text),
+        });
         this.directTransport = new DirectTransport({
             peerId: this.peerId,
             rtc: config.rtc,
@@ -123,8 +155,9 @@ export class PeerClient {
         });
         this.files = new FileTransfer({
             store: config.store,
-            sendChunk: (peerId, chunk) => this.delivery.send(peerId, '', undefined, undefined, undefined, undefined, chunk),
+            sendChunk: (peerId, chunk, groupId) => this.delivery.send(peerId, '', groupId, undefined, undefined, undefined, chunk),
             sendAttachment: (peerId, file) => this.delivery.sendDirectAttachment(peerId, [file]),
+            sendGroupAttachment: (groupId, file, recipients) => this.delivery.sendGroup(groupId, '', [file], recipients),
             emit: event => this.emit(event),
         });
     }
@@ -176,6 +209,7 @@ export class PeerClient {
         else
             this.groups.delete(group.id);
         this.emit({ kind: 'group', group });
+        this.groupMedia.membership(group);
         return group;
     }
     async lookupPeer(peerId: string): Promise<PeerDiscovery> {
@@ -271,6 +305,9 @@ export class PeerClient {
             try { this.applyGroup(raw); }
             catch { this.log('invalid group update'); }
         });
+        this.signal.on('group-call:update', (raw: unknown) => {
+            if (!this.closed) try { this.groupMedia.update(raw); } catch { this.log('invalid group call roster'); }
+        });
         this.signal.on("signal:receive", (packet: SignalPacket) => {
             if (packet.kind === 'media') { void this.receiveMedia(packet.from, packet.data); return; }
             void this.directTransport
@@ -278,6 +315,7 @@ export class PeerClient {
                 .catch((error: unknown) => this.log(`signal error: ${String(error)}`));
         });
         this.signal.on('disconnect', reason => {
+            this.groupMedia.offline();
             this.log(`signaling disconnected: ${reason}`);
             this.signalState = this.closed ? 'offline' : 'reconnecting';
             this.peers = [];
@@ -358,6 +396,7 @@ export class PeerClient {
         }
         this.signalState = 'online';
         this.connection();
+        void this.groupMedia.refresh().catch(error => this.log('group call discovery: ' + String(error)));
     }
     async createGroup(members: string[], name?: string): Promise<Group> {
         if (!this.signal)
@@ -486,6 +525,12 @@ export class PeerClient {
             throw new Error('invalid or blocked recipient');
         return this.files.send(receiverId, name, mime, data);
     }
+    async sendGroupFile(groupId: string, name: string, mime: string, data: Uint8Array) {
+        const group = await this.authorizeGroup(groupId, this.peerId);
+        if (group.archived || !group.members.includes(this.peerId)) throw Error('Bạn không còn quyền gửi file vào nhóm.');
+        return this.files.sendGroup(groupId, group.members.filter(id => id !== this.peerId), name, mime, data);
+    }
+    async retryDirect(peerId: string) { return this.directTransport.retry(peerId); }
     async retry(messageId: string, receiverId: string) {
         return this.delivery.retry(messageId, receiverId);
     }
@@ -505,6 +550,44 @@ export class PeerClient {
             }
         } catch (error) { this.log(`secure receive rejected: ${String(error)}`); }
     }
+    private async openMediaRelay(peerId: string, callId: string, group?: GroupCallContext): Promise<MediaLink> {
+        await this.waitForRelay();
+        let stopped = false, refreshing = false, failure = '';
+        const opened = new Set<Socket>(), input = { callId, to: peerId, ...(group ? { group } : {}) };
+        const refresh = async () => {
+            if (stopped || refreshing) return;
+            refreshing = true;
+            try {
+                await Promise.allSettled([...this.relays.values()].filter(socket => socket.connected).map(async socket => {
+                    try {
+                        const response = await this.call(socket, 'media:open', input);
+                        if (stopped) { if (response.ok) void this.call(socket, 'media:close', input).catch(() => {}); return; }
+                        if (response.ok) opened.add(socket);
+                        else { opened.delete(socket); failure = response.error || 'relay rejected the call'; }
+                    } catch (error) { opened.delete(socket); failure = String(error); }
+                }));
+            } finally { refreshing = false; }
+        };
+        await refresh();
+        if (!opened.size || this.closed) {
+            stopped = true;
+            for (const socket of opened) void this.call(socket, 'media:close', input).catch(() => {});
+            throw Error('Không mở được relay cuộc gọi. Kiểm tra cả hai thiết bị còn online và cùng mở URL Web mới nhất.' + (failure ? ' Chi tiết: ' + failure : ''));
+        }
+        const timer = setInterval(() => { void refresh(); }, 5000);
+        return {
+            send: (frame: MediaFrame) => {
+                if (stopped || this.closed) return false;
+                const preferred = this.activeRelay && this.relays.get(this.activeRelay);
+                const socket = preferred && opened.has(preferred) && preferred.connected ? preferred : [...opened].find(socket => socket.connected);
+                if (!socket || socket.io.engine.writeBuffer.length > (frame.kind === 'audio' ? 16 : 2)) return false;
+                if (frame.kind === 'video') socket.volatile.emit('media:frame', frame);
+                else socket.emit('media:frame', frame);
+                return true;
+            },
+            close: () => { if (stopped) return; stopped = true; clearInterval(timer); for (const socket of opened) void this.call(socket, 'media:close', input).catch(() => {}); opened.clear(); },
+        };
+    }
     private attachRelay(url: string) {
         url = url.replace(/\/$/, '');
         if (this.closed || this.relays.has(url)) return;
@@ -519,6 +602,7 @@ export class PeerClient {
         else socket.auth = { token: this.relayToken };
         this.relays.set(url, socket);
         socket.on('relay:receive', raw => { void this.receive(raw, 'RELAY'); });
+        socket.on('media:frame', raw => { void this.media.receiveFrame(raw); void this.groupMedia.receiveFrame(raw); });
         socket.on('overlay:signal', (packet: SignalPacket) => { if (packet.kind === 'media') void this.receiveMedia(packet.from, packet.data); else void this.directTransport.receiveSignal(packet).catch(error => this.log(String(error))); });
         socket.on('superpeer:leader', leader => {
             if (leader !== null) {
@@ -578,12 +662,16 @@ export class PeerClient {
         this.candidateTimer = setInterval(() => { void this.overlayCall('superpeer:offer', { url }).catch(error => this.log(String(error))); }, 10000);
     }
     private async receiveMedia(from: string, data: unknown) {
-        try { if (this.closed || await this.config.store.isDirectBlocked?.(from)) return; await this.media.receive(from, data); }
+        try {
+            if (this.closed || await this.config.store.isDirectBlocked?.(from)) return;
+            if (data && typeof data === 'object' && 'group' in data) await this.groupMedia.receive(from, data);
+            else await this.media.receive(from, data);
+        }
         catch (error) { this.log(`media signal rejected: ${String(error)}`); }
     }
     close() {
         this.closed = true;
-        clearInterval(this.advancedTimer); clearInterval(this.candidateTimer); this.media.close();
+        clearInterval(this.advancedTimer); clearInterval(this.candidateTimer); this.media.close(); this.groupMedia.close();
         this.cancelConnect?.(new Error('peer disconnected'));
         if (this.heartbeat)
             clearInterval(this.heartbeat);

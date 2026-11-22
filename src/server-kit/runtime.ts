@@ -22,14 +22,24 @@ export class AtomicState<T> {
         renameSync(temporary, this.path);
     }
 }
-export function guardSocket(socket: Socket, service: string, rpcEvents: string[], nodeId?: string) {
+export function guardSocket(socket: Socket, service: string, rpcEvents: string[], nodeId?: string, streamLimits: Record<string, number> = {}) {
     let since = Date.now(), count = 0;
+    const streams = new Map<string, { since: number; count: number }>();
     socket.use((packet, next) => {
         const [event, ...args] = packet;
         const reply = args.at(-1);
         if (rpcEvents.includes(event) && typeof reply !== 'function') {
             serviceLog(service, 'REJECT', `${event}: callback required`, nodeId);
             return;
+        }
+        if (Object.hasOwn(streamLimits, event)) {
+            let bucket = streams.get(event);
+            if (!bucket || Date.now() - bucket.since > 10000) { bucket = { since: Date.now(), count: 0 }; streams.set(event, bucket); }
+            if (++bucket.count > streamLimits[event]) {
+                if (bucket.count === streamLimits[event] + 1) serviceLog(service, 'REJECT', `${event}: stream rate limit`, nodeId);
+                return;
+            }
+            return next();
         }
         if (Date.now() - since > 10000) {
             since = Date.now();

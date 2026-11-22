@@ -12,6 +12,7 @@ import { requireSecret } from '../server-kit/secrets.ts';
 import { parseWireMessage, MAX_SEALED_WIRE_BYTES, type WireMessage } from '../shared/secure.ts';
 import { RelayCluster } from './cluster.ts';
 import { z } from 'zod';
+import { RelayMediaRouter } from './media.ts';
 if (process.env.NODE_ENV !== 'test') loadEnv({ path: join(projectRoot, '.env') });
 type Reply = (response: {
     ok: boolean;
@@ -44,7 +45,7 @@ export function createRelay(httpServer: HttpServer = createServer(), groupLookup
     const connections = new Map<string, Socket>();
     const nodeId = options.nodeId || process.env.NODE_ID || `relay-${randomUUID()}`;
     const log = (event: string, detail: string) => serviceLog('relay', event, detail, nodeId);
-    const metrics = { acceptedConnections: 0, replacedConnections: 0, rejectedConnections: 0, forwardedMessages: 0, rejectedMessages: 0, forwardedPayloadBytes: 0 };
+    const metrics = { acceptedConnections: 0, replacedConnections: 0, rejectedConnections: 0, forwardedMessages: 0, rejectedMessages: 0, forwardedPayloadBytes: 0, mediaFrames: 0, mediaBytes: 0, rejectedMedia: 0 };
     const offlineQueue = options.offlineQueue ?? process.env.RELAY_OFFLINE_QUEUE === '1';
     httpServer.on("request", app);
     const io = new Server(httpServer, {
@@ -103,6 +104,14 @@ export function createRelay(httpServer: HttpServer = createServer(), groupLookup
         const response = await fetch(`${base}/internal/sessions/authorize?${query}`, { headers: { 'x-peer-secret': SECRET }, signal: AbortSignal.timeout(2000) });
         if (!response.ok || (await response.json()).allowed !== true) throw Error('account session expired');
     };
+    const media = new RelayMediaRouter({ connections, authorize: authorizeDirect, session: authorizeSession, log, metrics,
+        authorizeGroup: async (senderId, receiverId, group) => {
+            const base = process.env.SIGNAL_INTERNAL_URL || 'http://127.0.0.1:4001';
+            const query = new URLSearchParams({ ...group, senderId, receiverId });
+            const response = await fetch(`${base}/internal/group-calls/authorize?${query}`, { headers: { 'x-peer-secret': SECRET }, signal: AbortSignal.timeout(2000) });
+            return response.ok && (await response.json()).allowed === true;
+        },
+    });
     io.use(async (socket, next) => {
         try {
             if (socket.handshake.auth.dht) {
@@ -129,12 +138,13 @@ export function createRelay(httpServer: HttpServer = createServer(), groupLookup
         }
     });
     io.on("connection", (socket) => {
-        guardSocket(socket, 'relay', ['relay:send', 'relay:probe', 'relay:consumed', 'dht:publish', 'dht:lookup', 'dht:key', 'dht:list', 'overlay:signal', 'superpeer:offer'], nodeId);
+        guardSocket(socket, 'relay', ['relay:send', 'relay:probe', 'relay:consumed', 'media:open', 'media:close', 'dht:publish', 'dht:lookup', 'dht:key', 'dht:list', 'overlay:signal', 'superpeer:offer'], nodeId, { 'media:frame': 2500 });
         const peerId = socket.data.peerId as string;
         const old = connections.get(peerId);
         if (old) metrics.replacedConnections++;
         old?.disconnect(true);
         connections.set(peerId, socket);
+        media.attach(socket);
         metrics.acceptedConnections++;
         log('REGISTER', `${peerId} connection=${socket.id} result=accepted replaced=${Boolean(old)}`);
         let expiryTimer: ReturnType<typeof setTimeout>;
