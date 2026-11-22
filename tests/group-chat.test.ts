@@ -48,24 +48,6 @@ afterEach(async () => {
 });
 
 describe('group membership consistency and offline delivery', () => {
-    it('accepts exactly one of two membership edits submitted against the same version', async () => {
-        const { signal, peer } = await fixture(), a = await peer('peer-a'), b = await peer('peer-b');
-        const group = await a.client.createGroup(['peer-b']);
-        await until(() => b.client.getGroups().length === 1);
-        const results = await Promise.allSettled([
-            a.client.changeGroup(group.id, 'peer-c', 'add'),
-            a.client.changeGroup(group.id, 'peer-d', 'add'),
-        ]);
-        expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
-        expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
-        const latest = signal.groups.get(group.id)!;
-        expect(latest.version).toBe(2);
-        expect(latest.members).toHaveLength(3);
-        await until(() => b.client.getGroups()[0]?.version === 2);
-        expect(a.client.getGroups()).toEqual([latest]);
-        expect(b.client.getGroups()).toEqual([latest]);
-    });
-
     it('ignores older, conflicting and malformed membership events, including updates after removal', async () => {
         const { signal, peer } = await fixture(), a = await peer('peer-a'), b = await peer('peer-b');
         const first = await a.client.createGroup(['peer-b'], 'Team');

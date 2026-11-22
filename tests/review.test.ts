@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { PeerClient, parseMessage, type ChatMessage, type ChatStore, type Group, type PeerConfig, type StoredMessage } from '../src/shared/index.ts';
+import { PeerClient, parseMessage, orderMessages, type ChatMessage, type ChatStore, type Group, type PeerConfig, type StoredMessage } from '../src/shared/index.ts';
 import { MessageDelivery } from '../src/shared/messageDelivery.ts';
 import { WebStore } from '../src/web-peer/store.ts';
 import { createSignaling } from '../src/signaling/index.ts';
@@ -92,9 +92,13 @@ describe('DS01 reliability and consistency review', () => {
         await Promise.all([a.client.sendGroup(group.id, 'broadcast-a'), b.client.sendGroup(group.id, 'broadcast-b')]);
         for (const body of ['broadcast-a', 'broadcast-b']) {
             const copies = [a, b, c].flatMap(item => item.store.rows).filter(row => row.message.body === body);
-            expect(copies).toHaveLength(4); // two outgoing copies, one incoming per recipient
+            expect(copies).toHaveLength(4);
             expect(new Set(copies.map(row => JSON.stringify(identity(row.message)))).size).toBe(1);
         }
+        const finalViews = [a, b, c].map(item => [...new Set(orderMessages(item.store.rows).map(row => row.message.messageId))]);
+        expect(finalViews[0]).toHaveLength(2);
+        expect(finalViews[1]).toEqual(finalViews[0]);
+        expect(finalViews[2]).toEqual(finalViews[0]);
     });
 
     it('settles overlapping retries without replacing the pending application ACK', async () => {
@@ -110,14 +114,37 @@ describe('DS01 reliability and consistency review', () => {
         expect(b.store.rows).toHaveLength(1);
     });
 
-    it.each(['group', 'sequence'] as const)('ignores an ACK with the wrong %s context', async mismatch => {
+    it('retries two failed group recipients concurrently while retaining one logical event', async () => {
+        const { peer } = await setup();
+        const a = await peer('peer-a');
+        const group = await a.client.createGroup(['peer-b', 'peer-c']);
+        expect(await a.client.sendGroup(group.id, 'retry both recipients')).toEqual({ 'peer-b': 'rejected', 'peer-c': 'rejected' });
+        const original = structuredClone(a.store.rows[0].message);
+        const b = await peer('peer-b'), c = await peer('peer-c');
+        await Promise.all([a.client.retry(original.messageId, 'peer-b'), a.client.retry(original.messageId, 'peer-c')]);
+        expect(a.store.rows).toHaveLength(2);
+        expect(a.store.rows.every(row => row.status === 'delivered')).toBe(true);
+        for (const receiver of [b, c]) {
+            expect(receiver.store.rows).toHaveLength(1);
+            expect(identity(receiver.store.rows[0].message)).toEqual(identity(original));
+        }
+    });
+
+    it.each(['group', 'sequence', 'session', 'sender', 'receiver', 'ackFor'] as const)('ignores an ACK with the wrong %s context', async mismatch => {
         const store = new MemoryStore();
         const group: Group = { id: randomUUID(), ownerId: 'peer-a', members: ['peer-a', 'peer-b'], version: 1 };
         let correctAckSent = false;
         const delivery = new MessageDelivery({ peerId: 'peer-a', store, ackTimeoutMs: 200, getGroup: () => group, syncProjectGroup: async () => group, authorizeGroup: async () => group, selectMode: async () => 'RELAY', emit: () => {}, log: () => {},
             transport: async message => {
-                const ack: ChatMessage = { ...message, messageId: randomUUID(), senderId: 'peer-b', receiverId: 'peer-a', type: 'ack', body: '', ackFor: message.messageId };
-                await delivery.receive({ ...ack, ...(mismatch === 'group' ? { groupId: null } : { sequence: ack.sequence + 1 }) }, 'RELAY');
+                const ack: ChatMessage = { ...message, messageId: randomUUID(), senderId: 'peer-b', receiverId: 'peer-a', type: 'ack', body: '', ackFor: message.messageId, ackRequested: false };
+                const invalid = { ...ack };
+                if (mismatch === 'group') invalid.groupId = null;
+                if (mismatch === 'sequence') invalid.sequence++;
+                if (mismatch === 'session') invalid.sessionId = randomUUID();
+                if (mismatch === 'sender') invalid.senderId = 'peer-outsider';
+                if (mismatch === 'receiver') invalid.receiverId = 'peer-other';
+                if (mismatch === 'ackFor') invalid.ackFor = randomUUID();
+                await delivery.receive(invalid, 'RELAY');
                 setTimeout(() => { correctAckSent = true; void delivery.receive(ack, 'RELAY'); }, 25);
             } });
         deliveries.push(delivery);
@@ -147,7 +174,7 @@ describe('DS01 reliability and consistency review', () => {
         const signalUrl = await listen(createSignaling());
         const relay = createRelay();
         const relayUrl = await listen(relay);
-        // Inject a faulty router that echoes a message to its source, with destination unchanged.
+
         relay.io.on('connection', socket => {
             socket.removeAllListeners('relay:send');
             socket.on('relay:send', (message, reply) => {
