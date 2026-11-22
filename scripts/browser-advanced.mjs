@@ -80,6 +80,11 @@ try {
         await evaluate(sessionId, `(async()=>{const {PeerClient}=await import('/@fs/'+${JSON.stringify(root.replaceAll('\\', '/') + '/src/shared/peer.ts')});const {WebStore}=await import('/store.ts');window.Peer=PeerClient;window.Store=WebStore;window.rtc=[];window.wire=[];window.events=[];const Native=RTCPeerConnection;window.RTC=class extends Native{constructor(...a){super(...a);window.rtc.push(this);this.addEventListener('icecandidateerror',e=>window.events.push({kind:'log',text:e.errorCode+':'+e.errorText}))}};const send=RTCDataChannel.prototype.send;RTCDataChannel.prototype.send=function(d){window.wire.push(JSON.parse(d));return send.call(this,d)};window.config={peerId:${JSON.stringify(id)},identityProof:'advanced-browser-'+${JSON.stringify(id)},displayName:${JSON.stringify(id)},signalUrl:${JSON.stringify(signalUrl)},relayUrl:${JSON.stringify(relayUrls[0])},relayUrls:[${JSON.stringify(relayUrls[1])}],rtc:RTC,store:new WebStore(${JSON.stringify(id)}),identityStore:new WebStore(${JSON.stringify(id)}),encryption:true,relaySelection:'latency-load',iceServers:[{urls:${JSON.stringify(`turn:127.0.0.1:${tp}?transport=udp`)},username:${JSON.stringify(username)},credential:${JSON.stringify(credential)}}],rtcPolicy:'relay',directTimeoutMs:8000,ackTimeoutMs:2000,onEvent:e=>{window.events.push(e);if(e.kind==='call')window.lastCall=e.call;}};window.peer=new PeerClient(config);await peer.connect();return true})()`);
     }
     const [a, b, c] = pages, rows = (s, id) => evaluate(s, `new Store(${JSON.stringify(id)}).list()`);
+    const relayMetrics = () => Promise.all(relayUrls.map(async url => {
+        const response = await fetch(url + '/health', { signal: AbortSignal.timeout(2500) });
+        if (!response.ok) throw Error('Relay health failed: ' + url);
+        return { url, ...(await response.json()).metrics };
+    }));
     const forwards = async () => (await Promise.all(relayUrls.map(async x => (await (await fetch(x + '/health')).json()).metrics.forwardedMessages))).reduce((x, y) => x + y, 0);
     const before = await forwards();
     const started = performance.now(); await evaluate(a, `peer.send('peer-b','TURN secret message')`);
@@ -109,9 +114,11 @@ try {
     for (const page of [a, b]) await evaluate(page, `nativeOutput.pause();nativeOutput.srcObject=null;nativeAudio.close()`);
     check('hangup releases camera and microphone tracks', await evaluate(a, `lastCall.local.getTracks().every(t=>t.readyState==='ended')`));
     for (const page of [a, b]) {
-        await evaluate(page, `(async()=>{peer.close();window.peer=new Peer({...config,simulateMediaIceFailure:true});window.relayWire=[];for(const s of peer.relays.values())s.on('media:frame',x=>relayWire.push(x));await peer.connect();for(const s of peer.relays.values())s.on('media:frame',x=>relayWire.push(x));})()`);
+        await evaluate(page, `(async()=>{peer.close();window.peer=new Peer({...config,relayUrl:${JSON.stringify(relayUrls[1])},relayUrls:[${JSON.stringify(relayUrls[0])}],relaySelection:'priority',forceRelay:true,simulateMediaIceFailure:true});window.relayWire=[];await peer.connect();for(const [url,s] of peer.relays)s.on('media:frame',frame=>relayWire.push({url,frame}));})()`);
     }
-    const mediaBefore = (await (await fetch(relayUrls[0] + '/health')).json()).metrics.mediaFrames;
+    await evaluate(a, `peer.send('peer-b','Select backup before media call')`);
+    await evaluate(b, `peer.send('peer-a','Confirm backup before media call')`);
+    const mediaBefore = await relayMetrics();
     await evaluate(a, `peer.media.start('peer-b','video')`);
     await until(() => evaluate(b, `lastCall?.phase==='incoming'`), 'blocked ICE incoming video');
     await evaluate(b, 'peer.media.accept()');
@@ -121,7 +128,15 @@ try {
         await until(() => evaluate(page, `remoteAnalyser.getFloatTimeDomainData(remoteSamples);remoteSamples.some(x=>Math.abs(x)>0.001)`), 'relay microphone signal in remote audio stream');
     }
     check('blocked ICE falls back to encrypted application relay with two-way video and audible audio samples', true);
-    check('relay frames carry authenticated ciphertext and separate media counters', await evaluate(b, `relayWire.length>0&&relayWire.every(x=>!!x.ciphertext&&!x.data&&!x.sdp)`) && (await (await fetch(relayUrls[0] + '/health')).json()).metrics.mediaFrames > mediaBefore);
+    const frameEvidence = await Promise.all([a, b].map(page => evaluate(page, `(async()=>{const {mediaFrameSchema}=await import('/@fs/'+${JSON.stringify(root.replaceAll('\\', '/') + '/src/shared/mediaProtocol.ts')});const frames=relayWire.map(x=>x.frame);const valid=frames.every(frame=>mediaFrameSchema.safeParse(frame).success&&frame.callId===lastCall.callId&&frame.senderId===lastCall.peerId&&frame.receiverId===peer.peerId);let authenticated=false,tamperRejected=false;if(valid&&frames.length){const frame=frames[0],cipher=await peer.secure.mediaCipher(frame.senderId,frame.callId);authenticated=(await cipher.open(frame)).length>0;try{await cipher.open({...frame,ciphertext:(frame.ciphertext[0]==='A'?'B':'A')+frame.ciphertext.slice(1)})}catch{tamperRejected=true}}return {peerId:peer.peerId,frames:frames.length,valid,authenticated,tamperRejected,kinds:[...new Set(frames.map(x=>x.kind))],relays:[...new Set(relayWire.map(x=>x.url))]}})()`)));
+    const mediaAfter = await relayMetrics();
+    const mediaDeltas = mediaAfter.map((value, index) => ({ url: value.url,
+        mediaFrames: value.mediaFrames - mediaBefore[index].mediaFrames, mediaBytes: value.mediaBytes - mediaBefore[index].mediaBytes,
+        forwardedMessages: value.forwardedMessages - mediaBefore[index].forwardedMessages, forwardedPayloadBytes: value.forwardedPayloadBytes - mediaBefore[index].forwardedPayloadBytes }));
+    report.relayMediaProof = { before: mediaBefore, after: mediaAfter, deltas: mediaDeltas, peers: frameEvidence };
+    check('both peers receive authenticated encrypted media and reject tampered ciphertext', frameEvidence.every(value => value.frames > 0 && value.valid && value.authenticated && value.tamperRejected && value.kinds.includes('audio') && value.kinds.includes('video')), frameEvidence);
+    check('media counters increase across the relay pool without chat forwarding', mediaDeltas.some(value => value.mediaFrames > 0 && value.mediaBytes > 0) && mediaDeltas.every(value => value.forwardedMessages === 0 && value.forwardedPayloadBytes === 0), mediaDeltas);
+    check('backup carries the media while the primary remains healthy and unused', mediaDeltas[0].mediaFrames === 0 && mediaDeltas[1].mediaFrames > 0 && frameEvidence.every(value => value.relays.length === 1 && value.relays[0] === relayUrls[1]), mediaDeltas);
     for (const page of [a, b]) await evaluate(page, `remoteAudio.close()`);
     await evaluate(a, `peer.media.mute('audio',true);peer.media.mute('video',true)`);
     check('relay mute disables the actual capture tracks', await evaluate(a, `lastCall.local.getTracks().every(t=>!t.enabled)`));
@@ -135,6 +150,8 @@ try {
     if (publicRelays) {
     report.passed = true;
     } else {
+    for (const page of [a, b]) await evaluate(page, `(async()=>{peer.close();window.peer=new Peer(config);await peer.connect()})()`);
+    await evaluate(a, `peer.setRelaySelection('priority')`);
     const stun = await evaluate(c, `(async()=>{const p=new RTC({iceServers:[{urls:${JSON.stringify(`stun:127.0.0.1:${tp}`)}}]});p.createDataChannel('stun-probe');const candidates=[];p.onicecandidate=e=>{if(e.candidate)candidates.push(e.candidate.toJSON())};await p.setLocalDescription(await p.createOffer());await new Promise(r=>{if(p.iceGatheringState==='complete')r();else{const timer=setTimeout(r,4000);p.onicegatheringstatechange=()=>{if(p.iceGatheringState==='complete'){clearTimeout(timer);r()}}}});p.close();return candidates})()`);
     report.stunCandidates = stun;
     report.stunBindingRequests = logs.turn.split('STUN_BINDING').length - 1;

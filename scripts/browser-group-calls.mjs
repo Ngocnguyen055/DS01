@@ -133,6 +133,12 @@ try {
         await evaluate(page, `(async()=>{peer.close();window.peer=new Peer({...config,simulateMediaIceFailure:true});await peer.connect()})()`);
         await resetCapture(page);
     }
+    const mediaMetrics = () => Promise.all(relayUrls.map(async url => {
+        const response = await fetch(url + '/health', { signal: AbortSignal.timeout(2500) });
+        if (!response.ok) throw Error('Relay health failed: ' + url);
+        return { url, ...(await response.json()).metrics };
+    }));
+    const mediaBefore = await mediaMetrics();
     for (const kind of ['audio', 'video']) {
         await evaluate(a, `peer.groupMedia.start(${JSON.stringify(report.groupId)},${JSON.stringify(kind)})`);
         const id = await until(() => evaluate(a, "groupCall?.phase==='active'&&groupCall.room.roomId"), 'new relay group room');
@@ -144,7 +150,12 @@ try {
         check('three-peer ' + kind + ' call falls back to encrypted relay when ICE is blocked', true);
         if (kind === 'audio') for (const page of pages) await evaluate(page, 'peer.groupMedia.leave()');
     }
-    check('multiple relay links remain isolated within the same group room', (await (await fetch(relayUrls[0] + '/health')).json()).metrics.mediaFrames > 0);
+    const mediaAfter = await mediaMetrics();
+    const mediaDeltas = mediaAfter.map((value, index) => ({ url: value.url,
+        mediaFrames: value.mediaFrames - mediaBefore[index].mediaFrames, mediaBytes: value.mediaBytes - mediaBefore[index].mediaBytes,
+        forwardedMessages: value.forwardedMessages - mediaBefore[index].forwardedMessages }));
+    report.relayMediaProof = { before: mediaBefore, after: mediaAfter, deltas: mediaDeltas };
+    check('multiple relay links remain isolated within the same group room', mediaDeltas.some(value => value.mediaFrames > 0 && value.mediaBytes > 0) && mediaDeltas.every(value => value.forwardedMessages === 0), mediaDeltas);
     await evaluate(c, `peer.groupMedia.leave();peer.close();localStorage.setItem('ds01-peer-id','peer-c');localStorage.setItem('ds01-display-name','Peer C');localStorage.setItem('ds01-peer-secret-peer-c','advanced-browser-peer-c')`);
     await reloadAndConnect(c);
     await resetCapture(c);
