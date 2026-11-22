@@ -1,11 +1,13 @@
 import type { Server, Socket } from "socket.io";
-import type { Group, PeerDiscovery } from "@ds01/shared";
+import type { Group, PeerConnection, PeerDiscovery, PeerProfile } from "@ds01/shared";
 import type { ProjectDirectory } from "./projectDirectory.ts";
 import type { Accounts } from './accounts.ts';
 export type PeerSession = {
     socket: Socket;
     lastSeen: number;
-    displayName?: string;
+    displayName: string;
+    status: 'online';
+    connection: PeerConnection;
 };
 export type DirectChatAuthorizer = (senderId: string, receiverId: string) => Promise<boolean>;
 export type SignalingReply = (response: {
@@ -13,6 +15,7 @@ export type SignalingReply = (response: {
     error?: string;
     token?: string;
     peers?: string[];
+    profiles?: PeerProfile[];
     groups?: Group[];
     group?: Group;
     peer?: PeerDiscovery;
@@ -32,5 +35,6 @@ export type SignalingContext = {
     publishGroup: (group: Group) => void;
     currentGroup: (id: string) => Promise<Group | null>;
     publishPresence: () => void;
+    onlineProfiles: () => PeerProfile[];
     peerFor: (socket: Socket) => string | undefined;
 };

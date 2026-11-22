@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { resolve, join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const children: ChildProcess[] = [];
@@ -34,7 +35,7 @@ async function health(url: string, process: ReturnType<typeof launch>) {
             const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(500) });
             if (response.ok) return response.json();
         }
-        catch { /* wait until the independent listener is ready */ }
+        catch {   }
         await new Promise(resolve => setTimeout(resolve, 50));
     }
     throw Error(`Startup timeout: ${process.errors()}`);
@@ -48,7 +49,7 @@ afterEach(async () => {
     }
     for (const directory of directories.splice(0)) {
         const checked = resolve(directory);
-        if (dirname(checked) !== join(root, '.data') || !basename(checked).startsWith('launcher-test-')) throw Error('Unexpected test cleanup path');
+        if (dirname(checked) !== resolve(tmpdir()) || !basename(checked).startsWith('launcher-test-')) throw Error('Unexpected test cleanup path');
         await rm(checked, { recursive: true, force: true });
     }
 });
@@ -56,9 +57,9 @@ afterEach(async () => {
 describe('documented Node service launch commands', () => {
     it('runs signaling and relay as independent processes and completes the sequential benchmark', async () => {
         const [signalPort, relayPort] = await Promise.all([freePort(), freePort()]);
-        const directory = join(root, '.data', `launcher-test-${randomUUID()}`);
+        const directory = join(tmpdir(), `launcher-test-${randomUUID()}`);
         directories.push(directory);
-        const env = { SIGNAL_PORT: String(signalPort), RELAY_PORT: String(relayPort), SIGNAL_INTERNAL_URL: `http://127.0.0.1:${signalPort}`, SIGNAL_STATE_PATH: join(directory, 'state.json'), ACCOUNT_STATE_PATH: join(directory, 'accounts.json'), PEER_SECRET: randomUUID() + randomUUID(), JWT_SECRET: randomUUID() + randomUUID() };
+        const env = { SIGNAL_PORT: String(signalPort), RELAY_PORT: String(relayPort), SIGNAL_INTERNAL_URL: `http://127.0.0.1:${signalPort}`, SIGNAL_STATE_PATH: join(directory, 'state.json'), ACCOUNT_STATE_PATH: join(directory, 'accounts.json'), RELAY_STATE_PATH: join(directory, 'relay.json'), PEER_SECRET: randomUUID() + randomUUID(), JWT_SECRET: randomUUID() + randomUUID() };
         const signal = launch('signaling', env), relay = launch('relay', env);
         const signalUrl = `http://127.0.0.1:${signalPort}`, relayUrl = `http://127.0.0.1:${relayPort}`;
         expect(await health(signalUrl, signal)).toMatchObject({ service: 'signaling', peers: 0 });
@@ -72,8 +73,13 @@ describe('documented Node service launch commands', () => {
 
     it('starts development watch mode and fails a benchmark with an unreachable endpoint within a bounded time', async () => {
         const port = await freePort();
-        const service = launch('relay', { RELAY_PORT: String(port) }, true);
+        const directory = join(tmpdir(), `launcher-test-${randomUUID()}`); directories.push(directory);
+        const service = launch('relay', { RELAY_PORT: String(port), RELAY_STATE_PATH: join(directory, 'relay.json') }, true);
         expect(await health(`http://127.0.0.1:${port}`, service)).toMatchObject({ service: 'relay' });
+        const duplicate = launch('relay', { RELAY_PORT: String(await freePort()), RELAY_STATE_PATH: join(directory, 'relay.json') });
+        expect(await duplicate.done).toBe(1);
+        expect(duplicate.errors()).toContain('already using');
+        expect((await fetch(`http://127.0.0.1:${port}/health`)).ok).toBe(true);
         const started = Date.now();
         const benchmark = launch('benchmark', { PUBLIC_SIGNAL_URL: 'http://127.0.0.1:1', PUBLIC_RELAY_URL: 'http://127.0.0.1:1' });
         expect(await benchmark.done).toBe(1);

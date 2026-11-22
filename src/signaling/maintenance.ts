@@ -1,22 +1,9 @@
 import { ACCOUNT_PEER_ID } from "./directChatAuthorization.ts";
 import type { SignalingContext } from "./types.ts";
-import { serviceLog } from '../server-kit/runtime.ts';
-/** Starts presence expiry and project-group synchronization jobs. */
+import { expirePeers } from './presence.ts';
+
 export function startSignalingMaintenance(context: SignalingContext) {
-    const presenceTimer = setInterval(() => {
-        for (const [peerId, peer] of context.peers)
-            if (peer.socket.data.authSession && !context.accounts.authorize(peerId, peer.socket.data.authSession)) {
-                peer.socket.emit('auth:expired');
-                peer.socket.disconnect(true);
-                serviceLog('auth', 'SESSION_EXPIRED', peerId);
-            }
-            else if (Date.now() - peer.lastSeen > context.heartbeatFreshMs) {
-                context.peers.delete(peerId);
-                peer.socket.disconnect(true);
-                serviceLog('signal', 'TIMEOUT', peerId);
-                context.publishPresence();
-            }
-    }, 5000);
+    const presenceTimer = setInterval(() => expirePeers(context), 5000);
     presenceTimer.unref();
     let synchronizing = false;
     const projectTimer = setInterval(async () => {
@@ -35,7 +22,7 @@ export function startSignalingMaintenance(context: SignalingContext) {
             }
         }
         catch {
-            // Authorization queries current state and fails closed if the API is down.
+
         }
         finally {
             synchronizing = false;

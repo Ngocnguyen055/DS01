@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch index.ts",
-    "start": "tsx index.ts"
+    "dev": "node ../../scripts/run-node.mjs signaling --watch",
+    "start": "node ../../scripts/run-node.mjs signaling"
   },
   "dependencies": {
     "@ds01/shared": "*",
