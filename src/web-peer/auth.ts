@@ -5,7 +5,7 @@ export type LoginSession = { account: Account; token: string; expiresAt: number 
 type AuthResult = { ok: boolean; error?: string; account?: Account; token?: string; expiresAt?: number };
 export const sessionKey = 'ds01-account-session-v1';
 
-/** Short-lived control connection. Never sends credentials to a relay. */
+
 export async function authRequest(url: string, event: string, input: unknown): Promise<AuthResult> {
     const socket = io(url, { autoConnect: false, reconnection: false });
     try {

@@ -9,7 +9,7 @@ function registeredPeer(socket: Socket, context: SignalingContext) {
         ? peerId
         : undefined;
 }
-/** Project-backed and standalone demo group membership handlers. */
+
 export function registerGroupHandlers(socket: Socket, context: SignalingContext) {
     socket.on("project:group", async (input: unknown, reply: SignalingReply) => {
         if (typeof reply !== "function")
@@ -23,10 +23,13 @@ export function registerGroupHandlers(socket: Socket, context: SignalingContext)
         if (typeof projectId !== "string" || !/^[a-f\d]{24}$/i.test(projectId))
             return reply({ ok: false, error: "invalid project ID" });
         try {
-            const group = await context.directory.project(projectId);
+            const fetched = await context.directory.project(projectId);
+            if (registeredPeer(socket, context) !== actor)
+                return reply({ ok: false, error: 'registration no longer active' });
+            if (fetched) context.publishGroup(fetched);
+            const group = fetched ? context.groups.get(fetched.id) : undefined;
             if (!group || !group.members.includes(actor))
                 return reply({ ok: false, error: "project group access denied" });
-            context.publishGroup(group);
             reply({ ok: true, group });
         }
         catch {
@@ -50,6 +53,8 @@ export function registerGroupHandlers(socket: Socket, context: SignalingContext)
             return reply({ ok: false, error: "invalid group authorization" });
         try {
             const group = await context.currentGroup(value.groupId);
+            if (registeredPeer(socket, context) !== actor)
+                return reply({ ok: false, error: 'registration no longer active' });
             if (!group ||
                 group.archived ||
                 !group.members.includes(actor) ||
@@ -96,7 +101,10 @@ export function registerGroupHandlers(socket: Socket, context: SignalingContext)
             context.groups.delete(group.id);
             return reply({ ok: false, error: 'group persistence unavailable' });
         }
-        group.members.forEach((peerId) => context.peers.get(peerId)?.socket.emit("group:update", group));
+        group.members.forEach(peerId => {
+            const target = context.peers.get(peerId)?.socket;
+            if (target && context.peerFor(target) === peerId) target.emit('group:update', group);
+        });
         serviceLog('signal', 'GROUP', `${group.id} members=${group.members.join(',')}`);
         reply?.({ ok: true, group });
     });
@@ -116,7 +124,7 @@ export function registerGroupHandlers(socket: Socket, context: SignalingContext)
             !group.members.includes(actor) ||
             group.version !== version ||
             !peerIdSchema.safeParse(memberId).success ||
-            !["add", "remove"].includes(String(action)))
+            (action !== 'add' && action !== 'remove'))
             return reply?.({
                 ok: false,
                 error: "invalid group change or stale version",
@@ -145,7 +153,10 @@ export function registerGroupHandlers(socket: Socket, context: SignalingContext)
             context.groups.set(group.id, group);
             return reply({ ok: false, error: 'group persistence unavailable' });
         }
-        [...new Set([...before, ...next.members])].forEach((peerId) => context.peers.get(peerId)?.socket.emit("group:update", next));
+        [...new Set([...before, ...next.members])].forEach(peerId => {
+            const target = context.peers.get(peerId)?.socket;
+            if (target && context.peerFor(target) === peerId) target.emit('group:update', next);
+        });
         serviceLog('signal', 'GROUP_CHANGE', `${next.id} v${next.version} owner=${next.ownerId}`);
         reply({ ok: true, group: next });
     });
