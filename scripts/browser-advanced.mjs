@@ -58,6 +58,11 @@ try {
     ws.onclose = () => { for (const p of pending.values()) { clearTimeout(p.timer); p.reject(Error('Chrome closed')); } pending.clear(); };
     call = (method, params = {}, sessionId) => new Promise((resolve, reject) => { const id = ++next, timer = setTimeout(() => { pending.delete(id); reject(Error('CDP timeout ' + method)); }, method === 'Page.captureScreenshot' ? 30000 : 12000); pending.set(id, { resolve, reject, timer }); ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); });
     const evaluate = async (session, expression) => { const value = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true }, session); if (value.exceptionDetails) throw Error(JSON.stringify(value.exceptionDetails)); return value.result.value; };
+    const reload = async session => {
+        await evaluate(session, 'window.qaReloadPending=true');
+        await call('Page.reload', {}, session);
+        await until(() => evaluate(session, '!window.qaReloadPending && document.readyState === "complete"'), 'fresh document after reload');
+    };
     const pages = [];
     for (const id of ['peer-a', 'peer-b', 'peer-c']) {
         const { browserContextId } = await call('Target.createBrowserContext');
@@ -147,7 +152,7 @@ try {
     await until(async () => (await rows(a, 'peer-a')).some(x => x.message.body === 'durable browser secret' && x.status === 'delivered'), 'delayed ACK');
     check('replicated mailbox survives primary failure in real browsers', true, { recoveryMs: performance.now() - switchStart });
     const identity = await evaluate(a, 'peer.secure.publicIdentity()'); await evaluate(a, 'peer.close(); window.deviceIdentity=null');
-    await call('Page.reload', {}, a); await until(() => evaluate(a, 'document.readyState === "complete"'), 'reload');
+    await reload(a);
     const restored = await evaluate(a, `(async()=>{const {WebStore}=await import('/store.ts');return (await new WebStore('peer-a').getIdentity()).public})()`);
     check('nonextractable device identity persists across browser reload', JSON.stringify(restored) === JSON.stringify(identity));
     signaling.kill();
@@ -158,10 +163,9 @@ try {
     await evaluate(b, `peer.send(${JSON.stringify(dhtIds[1])},'DHT real TURN secret')`);
     await until(() => evaluate(c, `(async()=>{return (await new Store('dht-device').list()).some(x=>x.message.body==='DHT real TURN secret'&&x.status==='received')})()`), 'DHT encrypted delivery');
     check('DHT uses real WebRTC TURN with signaling process stopped', await evaluate(b, `(async()=>{return (await new Store('dht-device').list()).some(x=>x.message.body==='DHT real TURN secret'&&x.message.mode==='TURN'&&x.status==='delivered')})()`));
-    await evaluate(c, 'peer.close()'); await call('Page.reload', {}, c);
-    await until(() => evaluate(c, '!!document.querySelector(".demo-toggle")'), 'DHT UI login');
-    await evaluate(c, 'document.querySelector(".demo-toggle").click()');
-    await pause(100);
+    await evaluate(c, 'peer.close()'); await reload(c);
+    await until(() => evaluate(c, `(()=>{const button=document.querySelector('.demo-toggle:not(:disabled)');if(!button)return false;button.click();return true})()`), 'DHT UI login');
+    await until(() => evaluate(c, '!!document.querySelector(".demo-card input[autocomplete=nickname]:not(:disabled)")'), 'DHT login form');
     await evaluate(c, `(()=>{const e=document.querySelector('input[autocomplete=nickname]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,'DHT Browser UI');e.dispatchEvent(new Event('input',{bubbles:true}));})()`);
     await pause(100);
     await evaluate(c, `[...document.querySelectorAll('button')].find(x=>x.textContent.includes('DHT')).click()`);
@@ -172,7 +176,7 @@ try {
     await evaluate(c, `document.querySelector('.diagnostics-link').click()`); await pause(100);
     check('application diagnostics show E2EE and decentralized discovery', await evaluate(c, `document.querySelector('.advanced-panel').textContent.includes('E2EE') && document.querySelector('.advanced-panel').textContent.includes('DHT')`));
     const screenshot = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, c); await writeFile(join(directory, 'advanced-ui.png'), Buffer.from(screenshot.data, 'base64'));
-    await call('Page.reload', {}, c);
+    await reload(c);
     await until(() => evaluate(c, `document.querySelector('.self-profile small')?.textContent===${JSON.stringify(report.uiDhtPeerId)} && !!document.querySelector('.connection-pill.is-online')`), 'DHT UI reload');
     check('DHT UI reload restores the same device identity', true);
     await until(() => evaluate(b, `(async()=>{return (await peer.lookupPeer(${JSON.stringify(report.uiDhtPeerId)})).online})()`), 'DHT application reachable');

@@ -58,6 +58,14 @@ try {
     ws.onclose = () => { for (const p of pending.values()) { clearTimeout(p.timer); p.reject(Error('Chrome closed')); } pending.clear(); };
     call = (method, params = {}, sessionId) => new Promise((resolve, reject) => { const id = ++next, timer = setTimeout(() => { pending.delete(id); reject(Error('CDP timeout ' + method)); }, method === 'Page.captureScreenshot' ? 30000 : 12000); pending.set(id, { resolve, reject, timer }); ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); });
     const evaluate = async (session, expression) => { const value = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true, userGesture: true }, session); if (value.exceptionDetails) throw Error(JSON.stringify(value.exceptionDetails)); return value.result.value; };
+    const reloadAndConnect = async session => {
+        await evaluate(session, 'window.qaReloadPending=true');
+        await call('Page.reload', {}, session);
+        await until(() => evaluate(session, '!window.qaReloadPending && document.readyState === "complete"'), 'fresh document after reload');
+        await until(() => evaluate(session, `(()=>{const button=document.querySelector('.demo-toggle:not(:disabled)');if(!button)return false;button.click();return true})()`), 'open peer login');
+        await until(() => evaluate(session, `(()=>{const form=document.querySelector('.demo-card');if(!form?.querySelector('button[type=submit]:not(:disabled)'))return false;form.requestSubmit();return true})()`), 'submit peer login');
+        await until(() => evaluate(session, '!!document.querySelector(".connection-pill.is-online")'), 'actual UI connected');
+    };
     const pages = [];
     for (const id of ['peer-a', 'peer-b', 'peer-c']) {
         const { browserContextId } = await call('Target.createBrowserContext');
@@ -138,12 +146,7 @@ try {
     }
     check('multiple relay links remain isolated within the same group room', (await (await fetch(relayUrls[0] + '/health')).json()).metrics.mediaFrames > 0);
     await evaluate(c, `peer.groupMedia.leave();peer.close();localStorage.setItem('ds01-peer-id','peer-c');localStorage.setItem('ds01-display-name','Peer C');localStorage.setItem('ds01-peer-secret-peer-c','advanced-browser-peer-c')`);
-    await call('Page.reload', {}, c);
-    await until(() => evaluate(c, '!!document.querySelector(".demo-toggle")'), 'UI reload');
-    await evaluate(c, `document.querySelector('.demo-toggle').click()`);
-    await until(() => evaluate(c, '!!document.querySelector(".demo-card")'), 'legacy login');
-    await evaluate(c, `document.querySelector('.demo-card').requestSubmit()`);
-    await until(() => evaluate(c, '!!document.querySelector(".connection-pill.is-online")'), 'actual UI connected');
+    await reloadAndConnect(c);
     await resetCapture(c);
     await until(() => evaluate(c, `!!document.querySelector('.group-call-panel[data-phase=incoming]')`), 'call invitation in actual UI');
     check('newly connected group member discovers the ongoing call without capture', await evaluate(c, 'captureCount===0'));
@@ -213,12 +216,7 @@ try {
     await Promise.all([connected(a, 'RELAY', 1, false), connected(b, 'RELAY', 1, false)]);
     check('removing a group member terminates that members media links and leaves the others connected', true);
     await evaluate(a, 'peer.groupMedia.leave()'); await evaluate(b, 'peer.groupMedia.leave()');
-    await call('Page.reload', {}, c);
-    await until(() => evaluate(c, `!!document.querySelector('.demo-toggle')`), 'login after reload');
-    await evaluate(c, `document.querySelector('.demo-toggle').click()`);
-    await until(() => evaluate(c, `!!document.querySelector('.demo-card')`), 'legacy login form rendered');
-    await evaluate(c, `document.querySelector('.demo-card').requestSubmit()`);
-    await until(() => evaluate(c, `!!document.querySelector('.connection-pill.is-online')`), 'session restored after reload');
+    await reloadAndConnect(c);
     await evaluate(c, `[...document.querySelectorAll('.conversation')].find(b=>b.textContent.includes('Group Calls QA')).click()`);
     await until(() => evaluate(c, `document.querySelectorAll('.call-history-entry').length>=3&&!!document.querySelector('.attachment')`), 'persistent group call and file history');
     check('reload retains call and file history and restores no stale active call', await evaluate(c, `!document.querySelector('.group-call-panel[data-phase=active]')&&JSON.parse(localStorage.getItem('ds01-history-v1-peer-c-calls')).every(record=>record.outcome!=='ongoing')`));
